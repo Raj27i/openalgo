@@ -1,7 +1,7 @@
 # Load and check environment variables before anything else
 import os
 from dotenv import load_dotenv
-load_and_check_env_variables()
+
 
 import re
 import sys
