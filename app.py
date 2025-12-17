@@ -1,5 +1,6 @@
 # Load and check environment variables before anything else
-from utils.env_check import load_and_check_env_variables  # Import the environment check function
+import os
+from dotenv import load_dotenv
 load_and_check_env_variables()
 
 import re
