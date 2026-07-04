@@ -149,6 +149,7 @@ export const PHASE_LABELS: Record<string, string> = {
   EXPIRY_DAY: 'Expiry day — no new positions',
   DONE: 'Session finished',
   KILLED: 'KILLED — max loss hit',
+  ERROR: 'Engine error — check logs',
 }
 
 export const LEG_STATE_STYLES: Record<StbtLegState, string> = {

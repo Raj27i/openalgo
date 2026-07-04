@@ -217,7 +217,7 @@ function LivePanel({ status }: { status: StbtStatusResponse }) {
   return (
     <div className="space-y-2">
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <Badge variant={live.phase === 'KILLED' ? 'destructive' : 'secondary'}>
+        <Badge variant={['KILLED', 'ERROR'].includes(live.phase) ? 'destructive' : 'secondary'}>
           {PHASE_LABELS[live.phase] || live.phase}
         </Badge>
         <div className="text-right">

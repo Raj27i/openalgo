@@ -137,8 +137,11 @@ def _hhmm(value: str) -> tuple[int, int]:
 _CFG = _load_config()
 
 # ── Connection (env only — injected by the Strategy Manager) ─────────────────
+# HOST_SERVER (from .env, e.g. https://yourdomain) takes priority: the host
+# injects OPENALGO_HOST with a 127.0.0.1:5000 fallback that is wrong on
+# production gunicorn+nginx deployments (nothing listens on that port there).
 API_KEY = os.getenv("OPENALGO_API_KEY", "").strip()
-HOST    = (os.getenv("OPENALGO_HOST") or os.getenv("HOST_SERVER") or "").strip()
+HOST    = (os.getenv("HOST_SERVER") or os.getenv("OPENALGO_HOST") or "").strip()
 WS_URL  = os.getenv("WEBSOCKET_URL", "").strip() or None
 
 # ── Instrument ───────────────────────────────────────────────────────────────
@@ -2070,8 +2073,11 @@ def main():
 
     except KeyboardInterrupt:
         log.info("KeyboardInterrupt — exiting cleanly.")
-    except Exception:
+    except Exception as exc:
         log.exception("Fatal unhandled exception.")
+        _set_phase("ERROR", message=f"Engine crashed: {exc}")
+        _notify(f"ENGINE ERROR: {exc} — check the strategy log. If positions are "
+                f"open, verify them at the broker.")
 
 
 if __name__ == "__main__":
