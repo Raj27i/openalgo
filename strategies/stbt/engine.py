@@ -65,6 +65,15 @@ IST = ZoneInfo("Asia/Kolkata")
 
 STBT_DIR = Path(__file__).resolve().parent
 
+# App root on sys.path: the subprocess is launched by script path, so Python
+# only adds strategies/scripts/ (and the stub adds strategies/). The platform
+# imports used for Telegram alerts (database.*, services.*) need the repo root.
+import sys  # noqa: E402
+
+_APP_ROOT = str(STBT_DIR.parent.parent)
+if _APP_ROOT not in sys.path:
+    sys.path.insert(0, _APP_ROOT)
+
 # STRATEGY_ID is injected by the /python Strategy Manager subprocess launcher.
 STRATEGY_ID = os.getenv("STRATEGY_ID", "").strip()
 if not STRATEGY_ID:
@@ -993,6 +1002,11 @@ def _append_history(final_phase: str, main_legs: list, hedge, expiry: str):
     Called only when a session truly ends (DONE / KILLED / same-day close),
     so realized figures equal the session totals. Best-effort like the
     status writer."""
+    # A session where nothing ever traded (entry never triggered, no hedge)
+    # is not worth a ledger row — e.g. off-hours starts or no-signal days.
+    if not any(leg.entry_price > 0 for leg in main_legs) and hedge is None:
+        log.info("[HISTORY] No trades this session — skipping history record.")
+        return
     try:
         records = []
         if os.path.exists(HISTORY_FILE):
