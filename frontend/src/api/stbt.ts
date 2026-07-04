@@ -1,4 +1,9 @@
-import type { StbtConfig, StbtParams, StbtStatusResponse } from '@/types/stbt'
+import type {
+  StbtConfig,
+  StbtHistoryResponse,
+  StbtParams,
+  StbtStatusResponse,
+} from '@/types/stbt'
 import { webClient } from './client'
 
 interface StbtMutationResponse {
@@ -55,6 +60,11 @@ export const stbtApi = {
 
   getStatus: async (strategyId: string): Promise<StbtStatusResponse> => {
     const response = await webClient.get<StbtStatusResponse>(`/stbt/api/status/${strategyId}`)
+    return response.data
+  },
+
+  getHistory: async (strategyId: string): Promise<StbtHistoryResponse> => {
+    const response = await webClient.get<StbtHistoryResponse>(`/stbt/api/history/${strategyId}`)
     return response.data
   },
 }

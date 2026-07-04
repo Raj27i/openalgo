@@ -59,7 +59,7 @@ from openalgo import api
 #  CONFIGURATION  — loaded from strategies/stbt/{STRATEGY_ID}_config.json
 # ─────────────────────────────────────────────────────────────────────────────
 
-VERSION = "3.0.0"
+VERSION = "3.1.0"
 
 IST = ZoneInfo("Asia/Kolkata")
 
@@ -99,6 +99,9 @@ _CONFIG_DEFAULTS = {
     "allow_day2_reentry": True,
     "check_next_day_after": "09:16",
     "hedge_target_premium": 20.0,   # buy OTM strike whose LTP is closest to this
+    "max_loss": 0.0,                # session kill switch in ₹ (0 = disabled)
+    "telegram_alerts": True,        # strategy-level Telegram notifications
+    "user_id": "",                  # owner username (written by blueprints/stbt.py)
     "entry_time": "11:00",
     "hedge_time": "15:26",
     "ws_close_time": "15:29",
@@ -164,6 +167,9 @@ ALLOW_DAY2_REENTRY    = bool(_CFG["allow_day2_reentry"])
 CHECK_NEXT_DAY_AFTER_H, CHECK_NEXT_DAY_AFTER_M = _hhmm(_CFG["check_next_day_after"])
 
 HEDGE_TARGET_PREMIUM = float(_CFG["hedge_target_premium"])
+MAX_LOSS             = float(_CFG["max_loss"])       # 0 = kill switch disabled
+TELEGRAM_ALERTS      = bool(_CFG["telegram_alerts"])
+OWNER_USER_ID        = str(_CFG["user_id"] or "")
 
 # Charges / brokerage estimate.
 BROKERAGE_PER_ORDER        = float(_CFG["brokerage_per_order"])
@@ -199,6 +205,8 @@ STRATEGY_TIMEOUT_S  = 25200 # 7-hour hard wall-clock limit for one run
 STATE_FILE        = str(STBT_DIR / f"{STRATEGY_ID}_state.json")
 ORDER_INTENT_FILE = str(STBT_DIR / f"{STRATEGY_ID}_order_intent.json")
 STATUS_FILE       = str(STBT_DIR / f"{STRATEGY_ID}_status.json")
+HISTORY_FILE      = str(STBT_DIR / f"{STRATEGY_ID}_history.json")
+HISTORY_MAX_RECORDS = 400
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  LOGGING  — stdout is captured by the Strategy Manager into per-run log file
@@ -225,6 +233,62 @@ def _on_signal(signum, _frame):
 
 signal.signal(signal.SIGTERM, _on_signal)
 signal.signal(signal.SIGINT,  _on_signal)
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  TELEGRAM NOTIFICATIONS  (best-effort, never blocks or breaks trading)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Reuses the platform's Telegram machinery directly: the alert service is a
+# plain httpx call to the Telegram Bot API with the token read from the DB, so
+# it works fine from this subprocess (env + cwd are inherited from the host).
+# Order-level alerts already fire on every placeorder; these add strategy
+# context (entries, SL, hedge, kill switch, session summary).
+
+_tg_chat_id: int | None = None
+_tg_resolved = False
+
+
+def _resolve_chat_id() -> int | None:
+    global _tg_chat_id, _tg_resolved
+    if _tg_resolved:
+        return _tg_chat_id
+    _tg_resolved = True
+    if not OWNER_USER_ID:
+        log.debug("[NOTIFY] No user_id in config — Telegram alerts unavailable.")
+        return None
+    try:
+        from database.telegram_db import get_telegram_user_by_username
+
+        user = get_telegram_user_by_username(OWNER_USER_ID)
+        if user and user.get("telegram_id"):
+            _tg_chat_id = int(user["telegram_id"])
+        else:
+            log.info("[NOTIFY] No linked Telegram account for %s — alerts off.", OWNER_USER_ID)
+    except Exception as exc:
+        log.warning("[NOTIFY] Telegram chat lookup failed: %s", exc)
+    return _tg_chat_id
+
+
+def _notify(text: str):
+    """Fire-and-forget strategy alert to the owner's Telegram (if linked)."""
+    if not TELEGRAM_ALERTS:
+        return
+    chat_id = _resolve_chat_id()
+    if not chat_id:
+        return
+
+    def _send():
+        try:
+            from services.telegram_alert_service import telegram_alert_service
+
+            telegram_alert_service.send_alert_sync(
+                chat_id, f"[{UNDERLYING} STBT] {text}"
+            )
+        except Exception as exc:
+            log.warning("[NOTIFY] Telegram send failed: %s", exc)
+
+    threading.Thread(target=_send, daemon=True, name="stbt-notify").start()
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  OPENALGO CLIENT
@@ -638,6 +702,8 @@ def _place_critical_order(symbol: str, action: str, quantity: int, label: str) -
     log.critical("[%s] *** %s %s FAILED AFTER ALL RETRIES — "
                  "MANUAL ACTION REQUIRED: %s qty=%d ***",
                  label, action, symbol, symbol, quantity)
+    _notify(f"CRITICAL [{label}]: {action} {symbol} qty={quantity} FAILED after all "
+            f"retries — MANUAL ACTION REQUIRED at the broker.")
     return None
 
 
@@ -812,40 +878,215 @@ def _set_phase(phase: str, main_legs: list | None = None, hedge=None,
     _write_status(main_legs or [], hedge, expiry, message)
 
 
+def _leg_mtm(leg, ltp: float) -> float:
+    """Unrealized P&L of an open short leg at the given LTP (0 if unknown)."""
+    if ltp <= 0 or leg.entry_price <= 0:
+        return 0.0
+    return (leg.entry_price - ltp) * leg.quantity
+
+
+def _hedge_mtm(hedge, ltp: float) -> float:
+    """Unrealized P&L of an open (long) hedge at the given LTP."""
+    if ltp <= 0 or hedge.buy_price <= 0:
+        return 0.0
+    return (ltp - hedge.buy_price) * hedge.quantity
+
+
 def _write_status(main_legs: list, hedge, expiry: str, message: str = ""):
     """Atomically write the live status snapshot consumed by the /stbt tab.
 
     Best-effort: a status-write failure must never take down the trading
-    loop, so all exceptions are swallowed after a log line.
+    loop, so all exceptions are swallowed after a log line. LTPs come from
+    the tick cache only (ws_ltp) — never REST — so this stays cheap.
     """
+    global _last_status_write
     try:
         gross = sum(leg.realized_pnl for leg in main_legs)
         charges = sum(getattr(leg, "charges_total", 0.0) for leg in main_legs)
+        mtm = 0.0
+
+        leg_dicts = []
+        for leg in main_legs:
+            d = leg.to_dict()
+            ltp = ws_ltp(leg.symbol)
+            d["ltp"] = round(ltp, 2)
+            d["mtm_pnl"] = 0.0
+            if leg.state == leg.IN_SHORT:
+                d["mtm_pnl"] = round(_leg_mtm(leg, ltp), 2)
+                mtm += d["mtm_pnl"]
+            leg_dicts.append(d)
+
+        hedge_dict = None
         if hedge:
             gross += hedge.realized_pnl
             charges += getattr(hedge, "charges_total", 0.0)
+            hedge_dict = hedge.to_dict()
+            ltp = ws_ltp(hedge.symbol)
+            hedge_dict["ltp"] = round(ltp, 2)
+            hedge_dict["mtm_pnl"] = 0.0
+            if hedge.state == hedge.OPEN:
+                hedge_dict["mtm_pnl"] = round(_hedge_mtm(hedge, ltp), 2)
+                mtm += hedge_dict["mtm_pnl"]
+
+        net = gross - charges
         payload = {
-            "version"     : VERSION,
-            "strategy_id" : STRATEGY_ID,
-            "underlying"  : UNDERLYING,
-            "phase"       : _PHASE,
-            "message"     : message,
-            "trade_date"  : _now_ist().date().isoformat(),
-            "expiry"      : expiry,
-            "quantity"    : main_legs[0].quantity if main_legs else 0,
-            "main_legs"   : [leg.to_dict() for leg in main_legs],
-            "hedge"       : hedge.to_dict() if hedge else None,
-            "gross_pnl"   : round(gross, 2),
-            "charges"     : round(charges, 2),
-            "net_pnl"     : round(gross - charges, 2),
-            "last_update" : _now_ist().isoformat(timespec="seconds"),
+            "version"      : VERSION,
+            "strategy_id"  : STRATEGY_ID,
+            "underlying"   : UNDERLYING,
+            "phase"        : _PHASE,
+            "message"      : message,
+            "trade_date"   : _now_ist().date().isoformat(),
+            "expiry"       : expiry,
+            "quantity"     : main_legs[0].quantity if main_legs else 0,
+            "main_legs"    : leg_dicts,
+            "hedge"        : hedge_dict,
+            "gross_pnl"    : round(gross, 2),
+            "charges"      : round(charges, 2),
+            "net_pnl"      : round(net, 2),
+            "mtm_pnl"      : round(mtm, 2),
+            "total_net_pnl": round(net + mtm, 2),
+            "max_loss"     : MAX_LOSS,
+            "last_update"  : _now_ist().isoformat(timespec="seconds"),
         }
         tmp = STATUS_FILE + ".tmp"
         with open(tmp, "w") as fh:
             json.dump(payload, fh, indent=2)
         os.replace(tmp, STATUS_FILE)
+        _last_status_write = time.time()
     except Exception as exc:
         log.warning("[STATUS] Could not write status file: %s", exc)
+
+
+_last_status_write = 0.0
+STATUS_REFRESH_SECS = 5
+
+
+def _maybe_refresh_status(main_legs: list, hedge, expiry: str):
+    """Throttled periodic status write so open-position MTM ticks live in
+    the UI even when no state transition happens."""
+    if time.time() - _last_status_write >= STATUS_REFRESH_SECS:
+        _write_status(main_legs, hedge, expiry)
+
+
+def _total_net(main_legs: list, hedge) -> float:
+    """Session net P&L including open-position MTM. Used by the kill switch,
+    so LTPs use live_ltp (REST fallback allowed — correctness over cost)."""
+    gross = sum(leg.realized_pnl for leg in main_legs)
+    charges = sum(getattr(leg, "charges_total", 0.0) for leg in main_legs)
+    for leg in main_legs:
+        if leg.state == leg.IN_SHORT:
+            gross += _leg_mtm(leg, live_ltp(leg.symbol))
+    if hedge:
+        gross += hedge.realized_pnl
+        charges += getattr(hedge, "charges_total", 0.0)
+        if hedge.state == hedge.OPEN:
+            gross += _hedge_mtm(hedge, live_ltp(hedge.symbol))
+    return gross - charges
+
+
+def _append_history(final_phase: str, main_legs: list, hedge, expiry: str):
+    """Append one completed-session record to the per-config history file.
+
+    Called only when a session truly ends (DONE / KILLED / same-day close),
+    so realized figures equal the session totals. Best-effort like the
+    status writer."""
+    try:
+        records = []
+        if os.path.exists(HISTORY_FILE):
+            try:
+                with open(HISTORY_FILE, encoding="utf-8") as fh:
+                    records = json.load(fh)
+                if not isinstance(records, list):
+                    records = []
+            except (json.JSONDecodeError, OSError):
+                records = []
+
+        gross = sum(leg.realized_pnl for leg in main_legs)
+        charges = sum(getattr(leg, "charges_total", 0.0) for leg in main_legs)
+        legs = [
+            {
+                "symbol": leg.symbol,
+                "opt_type": leg.opt_type,
+                "state": leg.state,
+                "cycles": leg.reentries + (1 if leg.entry_price > 0 else 0),
+                "realized_pnl": round(leg.realized_pnl, 2),
+                "charges": round(getattr(leg, "charges_total", 0.0), 2),
+            }
+            for leg in main_legs
+        ]
+        hedge_rec = None
+        if hedge:
+            gross += hedge.realized_pnl
+            charges += getattr(hedge, "charges_total", 0.0)
+            hedge_rec = {
+                "symbol": hedge.symbol,
+                "opt_type": hedge.opt_type,
+                "state": hedge.state,
+                "buy_price": round(hedge.buy_price, 2),
+                "realized_pnl": round(hedge.realized_pnl, 2),
+                "charges": round(getattr(hedge, "charges_total", 0.0), 2),
+            }
+
+        records.append(
+            {
+                "trade_date": _now_ist().date().isoformat(),
+                "ended_at": _now_ist().isoformat(timespec="seconds"),
+                "final_phase": final_phase,
+                "expiry": expiry,
+                "quantity": main_legs[0].quantity if main_legs else 0,
+                "legs": legs,
+                "hedge": hedge_rec,
+                "gross_pnl": round(gross, 2),
+                "charges": round(charges, 2),
+                "net_pnl": round(gross - charges, 2),
+            }
+        )
+        records = records[-HISTORY_MAX_RECORDS:]
+        tmp = HISTORY_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(records, fh, indent=2)
+        os.replace(tmp, HISTORY_FILE)
+        log.info("[HISTORY] Session record appended (%s, net=%.2f)",
+                 final_phase, gross - charges)
+    except Exception as exc:
+        log.warning("[HISTORY] Could not append session record: %s", exc)
+
+
+def _kill_session(main_legs: list, hedge, expiry: str, save_cb, total: float) -> None:
+    """Max-loss kill switch: close everything at market and end the session."""
+    log.critical("[KILL] Session net %.2f breached max loss ₹%.0f — "
+                 "force-exiting ALL positions.", total, MAX_LOSS)
+    _notify(f"KILL SWITCH: net ₹{total:,.2f} breached max loss ₹{MAX_LOSS:,.0f} — "
+            f"closing all positions at market.")
+
+    for leg in main_legs:
+        if leg.is_short:
+            leg.force_exit(save_cb)
+    if hedge and not hedge.is_done:
+        hedge.exit_at_market(save_cb)
+
+    open_legs = [leg for leg in main_legs if leg.is_short]
+    hedge_open = hedge is not None and not hedge.is_done
+
+    try:
+        ws_unsubscribe([leg.symbol for leg in main_legs])
+    except Exception:
+        pass
+
+    _log_pnl_summary(main_legs, hedge, label="KILLED")
+    _append_history("KILLED", main_legs, hedge, expiry)
+    _set_phase("KILLED", main_legs, hedge, expiry,
+               message=f"Max loss ₹{MAX_LOSS:,.0f} hit — session terminated")
+
+    if not open_legs and not hedge_open:
+        delete_state()
+        _notify("Kill switch complete — all positions closed.")
+    else:
+        save_cb()
+        log.critical("[KILL] *** Some exits FAILED — positions remain at broker. "
+                     "MANUAL ACTION REQUIRED. ***")
+        _notify("KILL SWITCH WARNING: some exits FAILED — check broker "
+                "positions NOW (manual action required).")
 
 
 def save_state(main_legs: list, hedge, expiry: str):
@@ -1256,6 +1497,8 @@ class MainLeg:
         self.state       = self.IN_SHORT
         log.info("[%s] SHORT entered  entry=%.2f  sl=%.2f  qty=%d",
                  self.opt_type, filled, self.sl_price, self.quantity)
+        _notify(f"SHORT {self.opt_type} {self.symbol} @ ₹{filled:.2f} "
+                f"(SL ₹{self.sl_price:.2f}, qty {self.quantity})")
         save_cb()
         return True
 
@@ -1273,6 +1516,8 @@ class MainLeg:
         self.state = self.SL_HIT
         log.info("[%s] Short covered.  Re-entries remaining: %d",
                  self.opt_type, MAX_REENTRIES - self.reentries)
+        _notify(f"SL HIT {self.opt_type} {self.symbol}: covered @ ₹{exit_price:.2f} "
+                f"(re-entries left: {MAX_REENTRIES - self.reentries})")
         save_cb()
         return True
 
@@ -1292,6 +1537,7 @@ class MainLeg:
                 oid, self.symbol, live_ltp(self.symbol) or self.entry_price)
             self._log_cycle_pnl(exit_price, "FORCE")
             self.state = self.DONE
+            _notify(f"Force-exited {self.opt_type} {self.symbol} @ ₹{exit_price:.2f}")
             save_cb()
             return True
         save_cb()   # keep IN_SHORT so operator knows position is still live
@@ -1371,6 +1617,7 @@ class HedgeLeg:
                      "+" if cycle_pnl - charges["total"] >= 0 else "",
                      cycle_pnl - charges["total"])
             self.state = self.DONE
+            _notify(f"Hedge sold: {self.symbol} @ ₹{exit_price:.2f}")
             save_cb()
             return True
         save_cb()
@@ -1504,6 +1751,14 @@ def run_day1():
                             candle_minute, candle_close = closed
                             leg.on_candle_close(candle_minute, candle_close, _save)
 
+        _maybe_refresh_status(main_legs, hedge, expiry)
+
+        if MAX_LOSS > 0 and any(leg.is_short for leg in main_legs):
+            total = _total_net(main_legs, hedge)
+            if total <= -MAX_LOSS:
+                _kill_session(main_legs, hedge, expiry, _save, total)
+                return
+
         now_ts = time.time()
         if now_ts - _last_status_log >= 120:
             log.info("CE %s=%.2f [%s]  |  PE %s=%.2f [%s]",
@@ -1538,6 +1793,8 @@ def run_day1():
                     _save()
                     _set_phase("HEDGED", main_legs, hedge, expiry,
                                message=f"Overnight hedge {h_sym} placed")
+                    _notify(f"Overnight hedge bought: {h_sym} @ ₹{fill_price:.2f} "
+                            f"(naked {naked.opt_type} covered)")
                 else:
                     log.error("[HEDGE] Order failed — overnight position is UNHEDGED.")
             else:
@@ -1566,6 +1823,10 @@ def run_day1():
         delete_state()   # clean up any leftover file so Day-1 runs tomorrow
         log.info("[STATE] No open positions — skipping save. "
                  "Next run will go to Day-1.")
+        # Session ended flat on Day-1 itself — record it now (no Day-2 run).
+        _append_history("DONE", main_legs, hedge, expiry)
+        _notify(f"Day-1 closed flat — session over. "
+                f"Net P&L: ₹{_total_net(main_legs, hedge):,.2f}")
 
     _log_pnl_summary(main_legs, hedge, label="DAY-1 REALIZED")
 
@@ -1681,6 +1942,14 @@ def run_day2():
                             candle_minute, candle_close = closed
                             leg.on_candle_close(candle_minute, candle_close, _save)
 
+        _maybe_refresh_status(main_legs, hedge, expiry)
+
+        if MAX_LOSS > 0 and any(leg.is_short for leg in main_legs):
+            total = _total_net(main_legs, hedge)
+            if total <= -MAX_LOSS:
+                _kill_session(main_legs, hedge, expiry, _save, total)
+                return
+
         now_ts = time.time()
         if now_ts - _last_status_log >= 120:
             log.info("  ".join(
@@ -1709,7 +1978,12 @@ def run_day2():
             [f"{l.opt_type}:{l.symbol}" for l in open_legs] or "none",
             hedge.symbol if hedge_open else "none",
         )
+        _notify("CRITICAL: Day-2 exits incomplete — open positions remain at the "
+                "broker. MANUAL ACTION REQUIRED.")
+    session_net = _total_net(main_legs, hedge)
+    _append_history("DONE", main_legs, hedge, expiry)
     _set_phase("DONE", main_legs, hedge, expiry, message="Session finished")
+    _notify(f"Session finished. Net P&L: ₹{session_net:,.2f}")
     log.info("=" * 60)
     log.info("DAY-2  Complete. %s STBT session finished.", UNDERLYING)
     log.info("=" * 60)

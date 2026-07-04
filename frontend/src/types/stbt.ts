@@ -10,6 +10,8 @@ export interface StbtParams {
   allow_day2_reentry?: boolean
   hedge_target_premium?: number
   lot_multiplier?: number
+  max_loss?: number
+  telegram_alerts?: boolean
   entry_time?: string
   hedge_time?: string
   ws_close_time?: string
@@ -48,6 +50,8 @@ export interface StbtLeg {
   reentries: number
   realized_pnl: number
   charges_total: number
+  ltp?: number
+  mtm_pnl?: number
 }
 
 export interface StbtHedge {
@@ -58,6 +62,8 @@ export interface StbtHedge {
   buy_price: number
   realized_pnl: number
   charges_total: number
+  ltp?: number
+  mtm_pnl?: number
 }
 
 export interface StbtLiveStatus {
@@ -74,6 +80,9 @@ export interface StbtLiveStatus {
   gross_pnl: number
   charges: number
   net_pnl: number
+  mtm_pnl?: number
+  total_net_pnl?: number
+  max_loss?: number
   last_update: string
 }
 
@@ -83,6 +92,34 @@ export interface StbtStatusResponse {
   is_error: boolean
   error_message?: string | null
   live: StbtLiveStatus | null
+}
+
+export interface StbtHistoryLeg {
+  symbol: string
+  opt_type: string
+  state: string
+  cycles: number
+  realized_pnl: number
+  charges: number
+}
+
+export interface StbtHistoryRecord {
+  trade_date: string
+  ended_at: string
+  final_phase: string
+  expiry: string
+  quantity: number
+  legs: StbtHistoryLeg[]
+  hedge: StbtHistoryLeg & { buy_price?: number } | null
+  gross_pnl: number
+  charges: number
+  net_pnl: number
+}
+
+export interface StbtHistoryResponse {
+  status: string
+  records: StbtHistoryRecord[]
+  total_net: number
 }
 
 export const SUPPORTED_UNDERLYINGS = [
@@ -111,6 +148,7 @@ export const PHASE_LABELS: Record<string, string> = {
   DAY2: 'Day 2 — exit session',
   EXPIRY_DAY: 'Expiry day — no new positions',
   DONE: 'Session finished',
+  KILLED: 'KILLED — max loss hit',
 }
 
 export const LEG_STATE_STYLES: Record<StbtLegState, string> = {

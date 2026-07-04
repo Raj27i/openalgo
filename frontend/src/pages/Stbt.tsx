@@ -1,7 +1,10 @@
 import {
   AlertTriangle,
   Calendar,
+  ChevronDown,
+  ChevronUp,
   Clock,
+  History,
   Moon,
   MoreVertical,
   Pencil,
@@ -47,6 +50,7 @@ import {
   PHASE_LABELS,
   SCHEDULE_DAY_OPTIONS,
   type StbtConfig,
+  type StbtHistoryRecord,
   type StbtLeg,
   type StbtStatusResponse,
   SUPPORTED_UNDERLYINGS,
@@ -61,6 +65,8 @@ interface FormState {
   max_reentries: string
   hedge_target_premium: string
   lot_multiplier: string
+  max_loss: string
+  telegram_alerts: boolean
   reentry_method: 'CANDLE_CLOSE' | 'LTP'
   allow_day2_reentry: boolean
   entry_time: string
@@ -81,6 +87,8 @@ const DEFAULT_FORM: FormState = {
   max_reentries: '1',
   hedge_target_premium: '20',
   lot_multiplier: '1',
+  max_loss: '0',
+  telegram_alerts: true,
   reentry_method: 'CANDLE_CLOSE',
   allow_day2_reentry: true,
   entry_time: '11:00',
@@ -103,6 +111,8 @@ function formFromConfig(config: StbtConfig): FormState {
     max_reentries: String(p.max_reentries ?? 1),
     hedge_target_premium: String(p.hedge_target_premium ?? 20),
     lot_multiplier: String(p.lot_multiplier ?? 1),
+    max_loss: String(p.max_loss ?? 0),
+    telegram_alerts: p.telegram_alerts ?? true,
     reentry_method: p.reentry_method === 'LTP' ? 'LTP' : 'CANDLE_CLOSE',
     allow_day2_reentry: p.allow_day2_reentry ?? true,
     entry_time: p.entry_time ?? '11:00',
@@ -127,6 +137,8 @@ function payloadFromForm(form: FormState): StbtConfigPayload {
     max_reentries: Number(form.max_reentries),
     hedge_target_premium: Number(form.hedge_target_premium),
     lot_multiplier: Number(form.lot_multiplier),
+    max_loss: Number(form.max_loss),
+    telegram_alerts: form.telegram_alerts,
     reentry_method: form.reentry_method,
     allow_day2_reentry: form.allow_day2_reentry,
     entry_time: form.entry_time,
@@ -147,27 +159,42 @@ function pnlClass(value: number): string {
 }
 
 function LegRow({ leg }: { leg: StbtLeg }) {
-  const net = leg.realized_pnl - leg.charges_total
+  const mtm = leg.state === 'IN_SHORT' ? (leg.mtm_pnl ?? 0) : 0
+  const net = leg.realized_pnl - leg.charges_total + mtm
   return (
     <div className="flex items-center justify-between gap-2 rounded-md border p-2 text-sm">
       <div className="min-w-0">
         <div className="truncate font-medium">{leg.symbol}</div>
         <div className="text-xs text-muted-foreground">
           {leg.state === 'WATCHING' ? (
-            <>ref ₹{leg.ref_premium.toFixed(2)}</>
+            <>
+              ref ₹{leg.ref_premium.toFixed(2)}
+              {(leg.ltp ?? 0) > 0 && <> · LTP ₹{(leg.ltp ?? 0).toFixed(2)}</>}
+            </>
           ) : (
             <>
-              entry ₹{leg.entry_price.toFixed(2)} · SL ₹{leg.sl_price.toFixed(2)} · re-entries{' '}
-              {leg.reentries}
+              entry ₹{leg.entry_price.toFixed(2)} · SL ₹{leg.sl_price.toFixed(2)}
+              {leg.state === 'IN_SHORT' && (leg.ltp ?? 0) > 0 && (
+                <> · LTP ₹{(leg.ltp ?? 0).toFixed(2)}</>
+              )}{' '}
+              · re-entries {leg.reentries}
             </>
           )}
         </div>
       </div>
       <div className="flex shrink-0 items-center gap-2">
-        <span className={pnlClass(net)}>
-          {net >= 0 ? '+' : ''}
-          {net.toFixed(2)}
-        </span>
+        <div className="text-right">
+          <div className={pnlClass(net)}>
+            {net >= 0 ? '+' : ''}
+            {net.toFixed(2)}
+          </div>
+          {leg.state === 'IN_SHORT' && (
+            <div className="text-[10px] text-muted-foreground">
+              MTM {mtm >= 0 ? '+' : ''}
+              {mtm.toFixed(2)}
+            </div>
+          )}
+        </div>
         <Badge variant="outline" className={LEG_STATE_STYLES[leg.state]}>
           {leg.state}
         </Badge>
@@ -185,14 +212,27 @@ function LivePanel({ status }: { status: StbtStatusResponse }) {
       </p>
     )
   }
+  const totalNet = live.total_net_pnl ?? live.net_pnl
+  const mtm = live.mtm_pnl ?? 0
   return (
     <div className="space-y-2">
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <Badge variant="secondary">{PHASE_LABELS[live.phase] || live.phase}</Badge>
-        <span className={`text-sm font-semibold ${pnlClass(live.net_pnl)}`}>
-          Net {live.net_pnl >= 0 ? '+' : ''}
-          {live.net_pnl.toFixed(2)}
-        </span>
+        <Badge variant={live.phase === 'KILLED' ? 'destructive' : 'secondary'}>
+          {PHASE_LABELS[live.phase] || live.phase}
+        </Badge>
+        <div className="text-right">
+          <span className={`text-sm font-semibold ${pnlClass(totalNet)}`}>
+            Net {totalNet >= 0 ? '+' : ''}
+            {totalNet.toFixed(2)}
+          </span>
+          {mtm !== 0 && (
+            <div className="text-[10px] text-muted-foreground">
+              realized {live.net_pnl >= 0 ? '+' : ''}
+              {live.net_pnl.toFixed(2)} · MTM {mtm >= 0 ? '+' : ''}
+              {mtm.toFixed(2)}
+            </div>
+          )}
+        </div>
       </div>
       {live.message && <p className="text-xs text-muted-foreground">{live.message}</p>}
       <div className="space-y-1.5">
@@ -205,18 +245,114 @@ function LivePanel({ status }: { status: StbtStatusResponse }) {
               <div className="truncate font-medium">HEDGE · {live.hedge.symbol}</div>
               <div className="text-xs text-muted-foreground">
                 bought ₹{live.hedge.buy_price.toFixed(2)}
+                {live.hedge.state === 'OPEN' && (live.hedge.ltp ?? 0) > 0 && (
+                  <> · LTP ₹{(live.hedge.ltp ?? 0).toFixed(2)}</>
+                )}
               </div>
             </div>
-            <Badge variant="outline">{live.hedge.state}</Badge>
+            <div className="flex shrink-0 items-center gap-2">
+              {live.hedge.state === 'OPEN' && (
+                <span className={`text-xs ${pnlClass(live.hedge.mtm_pnl ?? 0)}`}>
+                  {(live.hedge.mtm_pnl ?? 0) >= 0 ? '+' : ''}
+                  {(live.hedge.mtm_pnl ?? 0).toFixed(2)}
+                </span>
+              )}
+              <Badge variant="outline">{live.hedge.state}</Badge>
+            </div>
           </div>
         )}
       </div>
       <div className="flex justify-between text-xs text-muted-foreground">
         <span>
           Expiry {live.expiry} · qty {live.quantity}
+          {(live.max_loss ?? 0) > 0 && <> · max loss ₹{live.max_loss}</>}
         </span>
         <span>updated {live.last_update?.slice(11, 19)}</span>
       </div>
+    </div>
+  )
+}
+
+function HistorySection({ strategyId }: { strategyId: string }) {
+  const [open, setOpen] = useState(false)
+  const [loading, setLoading] = useState(false)
+  const [records, setRecords] = useState<StbtHistoryRecord[] | null>(null)
+  const [totalNet, setTotalNet] = useState(0)
+
+  const toggle = async () => {
+    const next = !open
+    setOpen(next)
+    if (next && records === null) {
+      try {
+        setLoading(true)
+        const data = await stbtApi.getHistory(strategyId)
+        setRecords(data.records || [])
+        setTotalNet(data.total_net || 0)
+      } catch {
+        showToast.error('Failed to load history', 'stbt')
+        setRecords([])
+      } finally {
+        setLoading(false)
+      }
+    }
+  }
+
+  return (
+    <div className="border-t pt-2">
+      <button
+        type="button"
+        onClick={toggle}
+        className="flex w-full items-center justify-between text-xs text-muted-foreground hover:text-foreground"
+      >
+        <span className="flex items-center gap-1">
+          <History className="h-3.5 w-3.5" /> Session history
+          {records !== null && <>&nbsp;· {records.length} sessions</>}
+        </span>
+        <span className="flex items-center gap-2">
+          {records !== null && records.length > 0 && (
+            <span className={pnlClass(totalNet)}>
+              Total {totalNet >= 0 ? '+' : ''}
+              {totalNet.toFixed(2)}
+            </span>
+          )}
+          {open ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
+        </span>
+      </button>
+      {open && (
+        <div className="mt-2">
+          {loading ? (
+            <Skeleton className="h-16" />
+          ) : !records || records.length === 0 ? (
+            <p className="py-2 text-xs text-muted-foreground">
+              No completed sessions yet — a record is added when a session finishes.
+            </p>
+          ) : (
+            <div className="max-h-56 space-y-1 overflow-y-auto">
+              {records.map((record) => (
+                <div
+                  key={record.ended_at}
+                  className="flex items-center justify-between gap-2 rounded-md bg-muted/40 px-2 py-1.5 text-xs"
+                >
+                  <div className="min-w-0">
+                    <span className="font-medium">{record.trade_date}</span>
+                    <span className="ml-2 text-muted-foreground">
+                      {record.final_phase === 'KILLED' ? '⛔ killed' : record.final_phase.toLowerCase()}
+                      {' · '}
+                      {record.legs?.reduce((sum, leg) => sum + (leg.cycles || 0), 0)} cycles
+                      {' · charges '}
+                      {record.charges.toFixed(0)}
+                    </span>
+                  </div>
+                  <span className={`shrink-0 font-medium ${pnlClass(record.net_pnl)}`}>
+                    {record.net_pnl >= 0 ? '+' : ''}
+                    {record.net_pnl.toFixed(2)}
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
     </div>
   )
 }
@@ -537,8 +673,12 @@ export default function Stbt() {
                     <span>re-entries {config.params?.max_reentries ?? 1}</span>
                     <span>hedge ≈₹{config.params?.hedge_target_premium ?? 20}</span>
                     <span>lots ×{config.params?.lot_multiplier ?? 1}</span>
+                    {(config.params?.max_loss ?? 0) > 0 && (
+                      <span className="text-red-500/80">max loss ₹{config.params?.max_loss}</span>
+                    )}
                   </div>
                   {status && <LivePanel status={status} />}
+                  <HistorySection strategyId={config.strategy_id} />
                 </CardContent>
               </Card>
             )
@@ -597,6 +737,7 @@ export default function Stbt() {
               max: '1000',
             })}
             {numberField('Lot multiplier', 'lot_multiplier', { step: '1', min: '1', max: '100' })}
+            {numberField('Max loss ₹ (0 = off)', 'max_loss', { step: '500', min: '0' })}
 
             <div className="space-y-1.5">
               <Label>Re-entry method</Label>
@@ -630,6 +771,22 @@ export default function Stbt() {
                 checked={form.allow_day2_reentry}
                 onCheckedChange={(checked) =>
                   setForm((prev) => ({ ...prev, allow_day2_reentry: checked }))
+                }
+              />
+            </div>
+
+            <div className="flex items-center justify-between rounded-md border p-3 sm:col-span-2">
+              <div>
+                <Label>Telegram alerts</Label>
+                <p className="text-xs text-muted-foreground">
+                  Entries, SL hits, hedge, kill switch, and session summary to your linked
+                  Telegram (needs the Telegram bot set up)
+                </p>
+              </div>
+              <Switch
+                checked={form.telegram_alerts}
+                onCheckedChange={(checked) =>
+                  setForm((prev) => ({ ...prev, telegram_alerts: checked }))
                 }
               />
             </div>

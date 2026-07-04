@@ -58,6 +58,7 @@ _NUMERIC_PARAMS = {
     "max_reentries": (int, 0, 5),
     "hedge_target_premium": (float, 1.0, 1000.0),
     "lot_multiplier": (int, 1, 100),
+    "max_loss": (float, 0.0, 10_000_000.0),  # session kill switch ₹; 0 = disabled
 }
 _TIME_PARAMS = ("entry_time", "hedge_time", "ws_close_time", "day2_open_time", "force_exit_time")
 _REENTRY_METHODS = {"CANDLE_CLOSE", "LTP"}
@@ -88,10 +89,15 @@ def _status_path(strategy_id: str) -> Path:
     return STBT_DIR / f"{strategy_id}_status.json"
 
 
+def _history_path(strategy_id: str) -> Path:
+    return STBT_DIR / f"{strategy_id}_history.json"
+
+
 def _runtime_paths(strategy_id: str) -> list[Path]:
     return [
         _config_path(strategy_id),
         _status_path(strategy_id),
+        _history_path(strategy_id),
         STBT_DIR / f"{strategy_id}_state.json",
         STBT_DIR / f"{strategy_id}_order_intent.json",
         STRATEGIES_DIR / f"{strategy_id}.py",
@@ -181,6 +187,9 @@ def _validate_params(data: dict, partial: bool = False) -> tuple[dict, str | Non
     if "allow_day2_reentry" in data and data["allow_day2_reentry"] is not None:
         clean["allow_day2_reentry"] = bool(data["allow_day2_reentry"])
 
+    if "telegram_alerts" in data and data["telegram_alerts"] is not None:
+        clean["telegram_alerts"] = bool(data["telegram_alerts"])
+
     return clean, None
 
 
@@ -257,6 +266,9 @@ def create_config():
     raw_name = str(data.get("name") or f"{underlying} STBT").strip()[:100]
 
     try:
+        # Owner username rides in the params JSON so the engine subprocess can
+        # resolve the Telegram chat id without host-only context.
+        params["user_id"] = user_id
         _write_json_atomic(_config_path(strategy_id), params)
 
         launcher_path = STRATEGIES_DIR / f"{strategy_id}.py"
@@ -455,5 +467,25 @@ def get_status(strategy_id):
             "is_error": entry.get("is_error", False),
             "error_message": entry.get("error_message"),
             "live": status,  # None until the engine writes its first snapshot
+        }
+    )
+
+
+@stbt_bp.route("/api/history/<strategy_id>", methods=["GET"])
+@check_session_validity
+def get_history(strategy_id):
+    user_id = session.get("user")
+    entry, error = _verify_stbt(strategy_id, user_id)
+    if error:
+        return error
+
+    raw = _read_json(_history_path(strategy_id))
+    records = raw if isinstance(raw, list) else []
+    total_net = round(sum(r.get("net_pnl", 0) or 0 for r in records), 2)
+    return jsonify(
+        {
+            "status": "success",
+            "records": list(reversed(records)),  # newest first for the UI
+            "total_net": total_net,
         }
     )

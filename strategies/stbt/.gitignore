@@ -2,5 +2,6 @@
 *_config.json
 *_state.json
 *_status.json
+*_history.json
 *_order_intent.json
 *.tmp
