@@ -1,0 +1,6 @@
+# Runtime artifacts created per STBT config — never commit user state.
+*_config.json
+*_state.json
+*_status.json
+*_order_intent.json
+*.tmp

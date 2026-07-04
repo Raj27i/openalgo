@@ -362,6 +362,12 @@ def react_python_logs(strategy_id):
     return serve_react_app()
 
 
+# STBT (Sell Today Buy Tomorrow) tab
+@react_bp.route("/stbt", strict_slashes=False)
+def react_stbt_index():
+    return serve_react_app()
+
+
 # Chartink Strategies
 # Note: Using strict_slashes=False to handle both /chartink and /chartink/
 @react_bp.route("/chartink", strict_slashes=False)

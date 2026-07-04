@@ -95,6 +95,7 @@ from blueprints.react_app import (  # Import React frontend blueprint
 )
 from blueprints.sandbox import sandbox_bp  # Import the sandbox blueprint
 from blueprints.search import search_bp
+from blueprints.stbt import stbt_bp  # Import the STBT tab blueprint
 from blueprints.security import security_bp  # Import the security blueprint
 from blueprints.settings import settings_bp  # Import the settings blueprint
 from blueprints.strategy import strategy_bp  # Import the strategy blueprint
@@ -302,6 +303,7 @@ def create_app():
     app.register_blueprint(chart_test_bp)  # Register standalone chart test page (dev/testing only)
     app.register_blueprint(pnltracker_bp)  # Register PnL tracker blueprint
     app.register_blueprint(python_strategy_bp)  # Register Python strategy blueprint
+    app.register_blueprint(stbt_bp)  # Register STBT tab blueprint (reuses python host)
     app.register_blueprint(telegram_bp)  # Register Telegram blueprint
     app.register_blueprint(whatsapp_bp)  # Register WhatsApp blueprint
     app.register_blueprint(security_bp)  # Register Security blueprint

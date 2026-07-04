@@ -234,6 +234,11 @@ const ALERT_CATEGORIES_DATA: {
     description: 'Python strategy uploads, execution, logs, and scheduling',
   },
   {
+    key: 'stbt',
+    label: 'STBT',
+    description: 'STBT config management, start/stop, and live session updates',
+  },
+  {
     key: 'flow',
     label: 'Flow Workflows',
     description: 'Visual workflow creation, execution, and management',

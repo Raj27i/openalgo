@@ -79,6 +79,9 @@ const NewStrategy = lazy(() => import('@/pages/strategy/NewStrategy'))
 const ViewStrategy = lazy(() => import('@/pages/strategy/ViewStrategy'))
 const ConfigureSymbols = lazy(() => import('@/pages/strategy/ConfigureSymbols'))
 
+// STBT (Sell Today Buy Tomorrow) page
+const Stbt = lazy(() => import('@/pages/Stbt'))
+
 // Python Strategy pages
 const PythonStrategyIndex = lazy(() => import('@/pages/python-strategy/PythonStrategyIndex'))
 const NewPythonStrategy = lazy(() => import('@/pages/python-strategy/NewPythonStrategy'))
@@ -231,6 +234,8 @@ function App() {
                 <Route path="/strategy/new" element={<NewStrategy />} />
                 <Route path="/strategy/:strategyId" element={<ViewStrategy />} />
                 <Route path="/strategy/:strategyId/configure" element={<ConfigureSymbols />} />
+                {/* STBT (Sell Today Buy Tomorrow) */}
+                <Route path="/stbt" element={<Stbt />} />
                 {/* Phase 6: Python Strategies */}
                 <Route path="/python" element={<PythonStrategyIndex />} />
                 <Route path="/python/new" element={<NewPythonStrategy />} />
