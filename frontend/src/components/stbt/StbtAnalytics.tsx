@@ -119,6 +119,17 @@ export default function StbtAnalytics() {
     [includeCharges],
   )
 
+  // Sum of a month block's traded cells for the monthly-total row.
+  const monthTotal = useCallback(
+    (block: MonthBlock) =>
+      block.weeks.reduce(
+        (sum, week) =>
+          sum + week.reduce((s, cell) => s + (cell && cell.cycles > 0 ? dayValue(cell) : 0), 0),
+        0,
+      ),
+    [dayValue],
+  )
+
   const { byDate, dates, maxAbs } = useMemo(() => {
     const map = new Map<string, StbtDailyPnl>()
     let mx = 0
@@ -326,6 +337,20 @@ export default function StbtAnalytics() {
                           </div>
                         ))}
                       </div>
+                      {(() => {
+                        const mt = monthTotal(block)
+                        return (
+                          <div className="mt-2 border-t pt-1.5 text-center text-xs">
+                            <span className="text-muted-foreground">Total </span>
+                            <span
+                              className={`font-medium ${mt >= 0 ? 'text-green-500' : 'text-red-500'}`}
+                            >
+                              {mt >= 0 ? '+' : ''}
+                              {formatCurrency(mt)}
+                            </span>
+                          </div>
+                        )
+                      })()}
                     </div>
                   ))}
                 </div>
