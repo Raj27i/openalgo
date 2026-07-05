@@ -1,4 +1,5 @@
 import type {
+  StbtAnalyticsResponse,
   StbtConfig,
   StbtHistoryResponse,
   StbtParams,
@@ -65,6 +66,15 @@ export const stbtApi = {
 
   getHistory: async (strategyId: string): Promise<StbtHistoryResponse> => {
     const response = await webClient.get<StbtHistoryResponse>(`/stbt/api/history/${strategyId}`)
+    return response.data
+  },
+
+  getAnalytics: async (params?: {
+    config?: string
+    from?: string
+    to?: string
+  }): Promise<StbtAnalyticsResponse> => {
+    const response = await webClient.get<StbtAnalyticsResponse>('/stbt/api/analytics', { params })
     return response.data
   },
 }

@@ -93,11 +93,16 @@ def _history_path(strategy_id: str) -> Path:
     return STBT_DIR / f"{strategy_id}_history.json"
 
 
+def _journal_path(strategy_id: str) -> Path:
+    return STBT_DIR / f"{strategy_id}_journal.json"
+
+
 def _runtime_paths(strategy_id: str) -> list[Path]:
     return [
         _config_path(strategy_id),
         _status_path(strategy_id),
         _history_path(strategy_id),
+        _journal_path(strategy_id),
         STBT_DIR / f"{strategy_id}_state.json",
         STBT_DIR / f"{strategy_id}_order_intent.json",
         STRATEGIES_DIR / f"{strategy_id}.py",
@@ -487,5 +492,142 @@ def get_history(strategy_id):
             "status": "success",
             "records": list(reversed(records)),  # newest first for the UI
             "total_net": total_net,
+        }
+    )
+
+
+def _owned_stbt_ids(user_id: str) -> set[str]:
+    """STBT config ids owned by this user (or ownerless legacy configs)."""
+    ids = set()
+    for sid, entry in STRATEGY_CONFIGS.items():
+        if not entry.get("stbt"):
+            continue
+        owner = entry.get("user_id")
+        if not owner or owner == user_id:
+            ids.add(sid)
+    return ids
+
+
+@stbt_bp.route("/api/analytics", methods=["GET"])
+@check_session_validity
+def get_analytics():
+    """AlgoTest-style analytics seeded from STBT per-cycle journals.
+
+    Aggregates every closed-cycle record (across the user's STBT configs, or a
+    single config via ?config=) into per-day totals, a cumulative equity curve,
+    and headline stats. Optional ?from=YYYY-MM-DD&to=YYYY-MM-DD date filter.
+    """
+    user_id = session.get("user")
+    owned = _owned_stbt_ids(user_id)
+
+    config_filter = (request.args.get("config") or "").strip()
+    if config_filter:
+        if config_filter not in owned:
+            return jsonify({"status": "error", "message": "STBT config not found"}), 404
+        owned = {config_filter}
+
+    date_from = (request.args.get("from") or "").strip()
+    date_to = (request.args.get("to") or "").strip()
+
+    # Collect cycle rows from each owned config's journal.
+    rows = []
+    for sid in owned:
+        raw = _read_json(_journal_path(sid))
+        if isinstance(raw, list):
+            rows.extend(raw)
+
+    # Per-day aggregation.
+    daily: dict[str, dict] = {}
+    for r in rows:
+        d = str(r.get("trade_date", ""))
+        if not d:
+            continue
+        if date_from and d < date_from:
+            continue
+        if date_to and d > date_to:
+            continue
+        gross = float(r.get("gross", 0) or 0)
+        charges = float(r.get("charges", 0) or 0)
+        net = float(r.get("net", gross - charges) or 0)
+        cell = daily.setdefault(
+            d,
+            {
+                "date": d,
+                "gross": 0.0,
+                "charges": 0.0,
+                "net": 0.0,
+                "cycles": 0,
+                "wins": 0,
+                "losses": 0,
+            },
+        )
+        cell["gross"] += gross
+        cell["charges"] += charges
+        cell["net"] += net
+        cell["cycles"] += 1
+        if net > 0:
+            cell["wins"] += 1
+        elif net < 0:
+            cell["losses"] += 1
+
+    daily_list = [
+        {
+            "date": c["date"],
+            "gross": round(c["gross"], 2),
+            "charges": round(c["charges"], 2),
+            "net": round(c["net"], 2),
+            "cycles": c["cycles"],
+            "wins": c["wins"],
+            "losses": c["losses"],
+        }
+        for c in sorted(daily.values(), key=lambda x: x["date"])
+    ]
+
+    # Cumulative equity curve (date-ordered).
+    curve = []
+    cum_net = cum_gross = 0.0
+    for c in daily_list:
+        cum_net += c["net"]
+        cum_gross += c["gross"]
+        curve.append(
+            {
+                "date": c["date"],
+                "cumulative_net": round(cum_net, 2),
+                "cumulative_gross": round(cum_gross, 2),
+            }
+        )
+
+    win_days = sum(1 for c in daily_list if c["net"] > 0)
+    loss_days = sum(1 for c in daily_list if c["net"] < 0)
+    best = max(daily_list, key=lambda x: x["net"], default=None)
+    worst = min(daily_list, key=lambda x: x["net"], default=None)
+    totals = {
+        "gross": round(sum(c["gross"] for c in daily_list), 2),
+        "charges": round(sum(c["charges"] for c in daily_list), 2),
+        "net": round(sum(c["net"] for c in daily_list), 2),
+        "cycles": sum(c["cycles"] for c in daily_list),
+        "trading_days": len(daily_list),
+        "win_days": win_days,
+        "loss_days": loss_days,
+        "best_day": best,
+        "worst_day": worst,
+    }
+
+    configs = [
+        {
+            "strategy_id": sid,
+            "name": STRATEGY_CONFIGS[sid].get("name", sid),
+            "underlying": (_read_json(_config_path(sid)) or {}).get("underlying", ""),
+        }
+        for sid in sorted(_owned_stbt_ids(user_id))
+    ]
+
+    return jsonify(
+        {
+            "status": "success",
+            "daily": daily_list,
+            "curve": curve,
+            "totals": totals,
+            "configs": configs,
         }
     )

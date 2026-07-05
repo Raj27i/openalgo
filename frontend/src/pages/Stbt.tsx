@@ -20,6 +20,8 @@ import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import StbtAnalytics from '@/components/stbt/StbtAnalytics'
 import {
   Dialog,
   DialogContent,
@@ -555,7 +557,18 @@ export default function Stbt() {
         </Button>
       </div>
 
-      {loading ? (
+      <Tabs defaultValue="configs" className="space-y-4">
+        <TabsList>
+          <TabsTrigger value="configs">Configs</TabsTrigger>
+          <TabsTrigger value="analytics">Analytics</TabsTrigger>
+        </TabsList>
+
+        <TabsContent value="analytics">
+          <StbtAnalytics />
+        </TabsContent>
+
+        <TabsContent value="configs" className="space-y-4">
+          {loading ? (
         <div className="grid gap-4 md:grid-cols-2">
           <Skeleton className="h-52" />
           <Skeleton className="h-52" />
@@ -685,6 +698,8 @@ export default function Stbt() {
           })}
         </div>
       )}
+        </TabsContent>
+      </Tabs>
 
       {/* Create / edit dialog */}
       <Dialog open={formOpen} onOpenChange={setFormOpen}>

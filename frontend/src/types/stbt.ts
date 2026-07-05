@@ -122,6 +122,48 @@ export interface StbtHistoryResponse {
   total_net: number
 }
 
+export interface StbtDailyPnl {
+  date: string
+  gross: number
+  charges: number
+  net: number
+  cycles: number
+  wins: number
+  losses: number
+}
+
+export interface StbtCurvePoint {
+  date: string
+  cumulative_net: number
+  cumulative_gross: number
+}
+
+export interface StbtAnalyticsTotals {
+  gross: number
+  charges: number
+  net: number
+  cycles: number
+  trading_days: number
+  win_days: number
+  loss_days: number
+  best_day: StbtDailyPnl | null
+  worst_day: StbtDailyPnl | null
+}
+
+export interface StbtAnalyticsConfig {
+  strategy_id: string
+  name: string
+  underlying: string
+}
+
+export interface StbtAnalyticsResponse {
+  status: string
+  daily: StbtDailyPnl[]
+  curve: StbtCurvePoint[]
+  totals: StbtAnalyticsTotals
+  configs: StbtAnalyticsConfig[]
+}
+
 export const SUPPORTED_UNDERLYINGS = [
   'SENSEX',
   'BANKEX',

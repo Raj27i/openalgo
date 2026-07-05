@@ -3,5 +3,6 @@
 *_state.json
 *_status.json
 *_history.json
+*_journal.json
 *_order_intent.json
 *.tmp

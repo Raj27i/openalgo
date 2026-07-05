@@ -59,7 +59,7 @@ from openalgo import api
 #  CONFIGURATION  — loaded from strategies/stbt/{STRATEGY_ID}_config.json
 # ─────────────────────────────────────────────────────────────────────────────
 
-VERSION = "3.1.0"
+VERSION = "3.2.0"
 
 IST = ZoneInfo("Asia/Kolkata")
 
@@ -218,6 +218,7 @@ STATE_FILE        = str(STBT_DIR / f"{STRATEGY_ID}_state.json")
 ORDER_INTENT_FILE = str(STBT_DIR / f"{STRATEGY_ID}_order_intent.json")
 STATUS_FILE       = str(STBT_DIR / f"{STRATEGY_ID}_status.json")
 HISTORY_FILE      = str(STBT_DIR / f"{STRATEGY_ID}_history.json")
+JOURNAL_FILE      = str(STBT_DIR / f"{STRATEGY_ID}_journal.json")
 HISTORY_MAX_RECORDS = 400
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1069,6 +1070,62 @@ def _append_history(final_phase: str, main_legs: list, hedge, expiry: str):
         log.warning("[HISTORY] Could not append session record: %s", exc)
 
 
+JOURNAL_MAX_RECORDS = 2000
+
+
+def _append_journal(record: dict):
+    """Append one closed-cycle record to the per-config journal file.
+
+    This is the seed for the Analytics tab (calendar heatmap + equity curve).
+    Best-effort, atomic tmp+replace, capped — a journal write must never
+    affect trading."""
+    try:
+        rows = []
+        if os.path.exists(JOURNAL_FILE):
+            try:
+                with open(JOURNAL_FILE, encoding="utf-8") as fh:
+                    rows = json.load(fh)
+                if not isinstance(rows, list):
+                    rows = []
+            except (json.JSONDecodeError, OSError):
+                rows = []
+        rows.append(record)
+        rows = rows[-JOURNAL_MAX_RECORDS:]
+        tmp = JOURNAL_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(rows, fh, indent=2)
+        os.replace(tmp, JOURNAL_FILE)
+    except Exception as exc:
+        log.warning("[JOURNAL] Could not append cycle record: %s", exc)
+
+
+def _journal_cycle(leg_label: str, cycle: int, reason: str, entry: float,
+                   exit_price: float, qty: int, gross: float, charges: dict):
+    """Build + persist a per-cycle journal record from values the caller
+    already computed (no recompute)."""
+    _append_journal(
+        {
+            "closed_at": _now_ist().isoformat(timespec="seconds"),
+            "trade_date": _now_ist().date().isoformat(),
+            "config_id": STRATEGY_ID,
+            "underlying": UNDERLYING,
+            "leg": leg_label,
+            "cycle": cycle,
+            "reason": reason,
+            "entry": round(entry, 2),
+            "exit": round(exit_price, 2),
+            "qty": qty,
+            "gross": round(gross, 2),
+            "charges": round(charges.get("total", 0.0), 2),
+            "charge_breakdown": {
+                k: round(charges.get(k, 0.0), 2)
+                for k in ("brokerage", "stt", "exchange_txn", "sebi", "stamp", "gst")
+            },
+            "net": round(gross - charges.get("total", 0.0), 2),
+        }
+    )
+
+
 def _kill_session(main_legs: list, hedge, expiry: str, save_cb, total: float) -> None:
     """Max-loss kill switch: close everything at market and end the session."""
     log.critical("[KILL] Session net %.2f breached max loss ₹%.0f — "
@@ -1453,6 +1510,8 @@ class MainLeg:
                  cycle_pnl - charges["total"],
                  "+" if self.realized_pnl >= 0 else "", self.realized_pnl,
                  self.charges_total)
+        _journal_cycle(self.opt_type, cycle_num, reason, self.entry_price,
+                       exit_price, self.quantity, cycle_pnl, charges)
 
     def on_tick(self, ltp: float, save_cb, allow_reentry_on_ltp: bool = True) -> bool:
         """Evaluate latest LTP.
@@ -1634,6 +1693,8 @@ class HedgeLeg:
                      "+" if cycle_pnl - charges["total"] >= 0 else "",
                      cycle_pnl - charges["total"])
             self.state = self.DONE
+            _journal_cycle("HEDGE", 1, "HEDGE", self.buy_price, exit_price,
+                           self.quantity, cycle_pnl, charges)
             _notify(f"Hedge sold: {self.symbol} @ ₹{exit_price:.2f}")
             save_cb()
             return True
