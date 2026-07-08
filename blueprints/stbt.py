@@ -195,6 +195,9 @@ def _validate_params(data: dict, partial: bool = False) -> tuple[dict, str | Non
     if "telegram_alerts" in data and data["telegram_alerts"] is not None:
         clean["telegram_alerts"] = bool(data["telegram_alerts"])
 
+    if "use_smart_exit" in data and data["use_smart_exit"] is not None:
+        clean["use_smart_exit"] = bool(data["use_smart_exit"])
+
     return clean, None
 
 
