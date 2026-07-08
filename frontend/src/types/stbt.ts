@@ -164,6 +164,14 @@ export interface StbtAnalyticsResponse {
   configs: StbtAnalyticsConfig[]
 }
 
+export interface StbtPanicResponse {
+  status: string // "success" | "partial" | "error"
+  closed: string[]
+  already_flat: string[]
+  failed: string[]
+  message: string
+}
+
 export const SUPPORTED_UNDERLYINGS = [
   'SENSEX',
   'BANKEX',

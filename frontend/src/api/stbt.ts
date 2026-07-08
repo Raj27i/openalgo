@@ -2,6 +2,7 @@ import type {
   StbtAnalyticsResponse,
   StbtConfig,
   StbtHistoryResponse,
+  StbtPanicResponse,
   StbtParams,
   StbtStatusResponse,
 } from '@/types/stbt'
@@ -75,6 +76,11 @@ export const stbtApi = {
     to?: string
   }): Promise<StbtAnalyticsResponse> => {
     const response = await webClient.get<StbtAnalyticsResponse>('/stbt/api/analytics', { params })
+    return response.data
+  },
+
+  panic: async (strategyId: string): Promise<StbtPanicResponse> => {
+    const response = await webClient.post<StbtPanicResponse>(`/stbt/api/panic/${strategyId}`, {})
     return response.data
   },
 }

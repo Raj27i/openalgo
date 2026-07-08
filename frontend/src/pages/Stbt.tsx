@@ -369,6 +369,8 @@ export default function Stbt() {
   const [form, setForm] = useState<FormState>(DEFAULT_FORM)
   const [saving, setSaving] = useState(false)
   const [deleteTarget, setDeleteTarget] = useState<StbtConfig | null>(null)
+  const [panicTarget, setPanicTarget] = useState<StbtConfig | null>(null)
+  const [panicking, setPanicking] = useState(false)
 
   const fetchConfigs = async (silent = false) => {
     try {
@@ -480,6 +482,35 @@ export default function Stbt() {
       showToast.error(axiosError.response?.data?.message || 'Failed to stop', 'stbt')
     } finally {
       setActionLoading(null)
+    }
+  }
+
+  const handlePanic = async () => {
+    if (!panicTarget) return
+    const id = panicTarget.strategy_id
+    try {
+      setPanicking(true)
+      const res = await stbtApi.panic(id)
+      if (res.status === 'success') {
+        showToast.success(
+          `Closed ${res.closed.length}, ${res.already_flat.length} already flat`,
+          'stbt',
+        )
+      } else if (res.status === 'partial') {
+        showToast.error(
+          `${res.failed.length} FAILED to close (${res.failed.join(', ')}) — check broker now`,
+          'stbt',
+        )
+      } else {
+        showToast.error(res.message || 'Panic close failed', 'stbt')
+      }
+    } catch (error: unknown) {
+      const axiosError = error as { response?: { data?: { message?: string } } }
+      showToast.error(axiosError.response?.data?.message || 'Panic close failed', 'stbt')
+    } finally {
+      setPanicking(false)
+      setPanicTarget(null)
+      fetchConfigs(true)
     }
   }
 
@@ -647,6 +678,26 @@ export default function Stbt() {
                           <span className="ml-1 hidden sm:inline">Start</span>
                         </Button>
                       )}
+                      {(() => {
+                        const live = status?.live
+                        const hasPosition =
+                          !!live &&
+                          ((live.main_legs || []).some((l) => l.state === 'IN_SHORT') ||
+                            live.hedge?.state === 'OPEN')
+                        if (!config.is_running && !hasPosition) return null
+                        return (
+                          <Button
+                            size="sm"
+                            variant="destructive"
+                            disabled={busy}
+                            onClick={() => setPanicTarget(config)}
+                            title="Close every position for this config at market now"
+                          >
+                            <AlertTriangle className="h-4 w-4" />
+                            <span className="ml-1 hidden sm:inline">Close all</span>
+                          </Button>
+                        )
+                      })()}
                       <DropdownMenu>
                         <DropdownMenuTrigger asChild>
                           <Button size="sm" variant="ghost">
@@ -876,6 +927,33 @@ export default function Stbt() {
               onClick={handleDelete}
             >
               <Trash2 className="mr-1 h-4 w-4" /> Delete
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Panic close-all confirmation */}
+      <Dialog open={!!panicTarget} onOpenChange={(open) => !open && setPanicTarget(null)}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Close all positions for {panicTarget?.name}?</DialogTitle>
+            <DialogDescription>
+              This stops the strategy and immediately force-closes every leg and hedge it holds
+              at market, then clears its state. Use this only in an emergency — it acts on your
+              real broker account.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setPanicTarget(null)} disabled={panicking}>
+              Cancel
+            </Button>
+            <Button variant="destructive" disabled={panicking} onClick={handlePanic}>
+              {panicking ? (
+                <RefreshCw className="mr-1 h-4 w-4 animate-spin" />
+              ) : (
+                <AlertTriangle className="mr-1 h-4 w-4" />
+              )}
+              Close all now
             </Button>
           </DialogFooter>
         </DialogContent>

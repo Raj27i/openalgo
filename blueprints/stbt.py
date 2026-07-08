@@ -29,6 +29,8 @@ from blueprints.python_strategy import (
     stop_strategy_process,
     unschedule_strategy,
 )
+from database.auth_db import get_api_key_for_tradingview
+from services.place_smart_order_service import place_smart_order
 from utils.logging import get_logger
 from utils.session import check_session_validity
 
@@ -46,6 +48,17 @@ SUPPORTED_UNDERLYINGS = {
     "BANKNIFTY": "NSE",
     "FINNIFTY": "NSE",
     "MIDCPNIFTY": "NSE",
+}
+
+# Underlying → options exchange (mirror of engine INDEX_MAP), for the panic
+# close-all path which flattens by symbol directly (independent of the engine).
+_OPT_EXCHANGE = {
+    "SENSEX": "BFO",
+    "BANKEX": "BFO",
+    "NIFTY": "NFO",
+    "BANKNIFTY": "NFO",
+    "FINNIFTY": "NFO",
+    "MIDCPNIFTY": "NFO",
 }
 
 _TIME_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
@@ -95,6 +108,10 @@ def _history_path(strategy_id: str) -> Path:
 
 def _journal_path(strategy_id: str) -> Path:
     return STBT_DIR / f"{strategy_id}_journal.json"
+
+
+def _state_path(strategy_id: str) -> Path:
+    return STBT_DIR / f"{strategy_id}_state.json"
 
 
 def _runtime_paths(strategy_id: str) -> list[Path]:
@@ -632,5 +649,123 @@ def get_analytics():
             "curve": curve,
             "totals": totals,
             "configs": configs,
+        }
+    )
+
+
+def _open_symbols(strategy_id: str) -> list[str]:
+    """Every option symbol this config could currently hold, from the live
+    status + persisted state snapshots (deduped, order preserved).
+
+    Over-inclusion is harmless: the panic flatten targets position_size=0, so
+    a symbol already flat is a no-op. We'd rather flatten a stale symbol than
+    miss a live one."""
+    seen: dict[str, None] = {}
+    for path in (_status_path(strategy_id), _state_path(strategy_id)):
+        snap = _read_json(path)
+        if not isinstance(snap, dict):
+            continue
+        for leg in snap.get("main_legs") or []:
+            sym = (leg or {}).get("symbol")
+            if sym:
+                seen.setdefault(str(sym), None)
+        hedge = snap.get("hedge")
+        if isinstance(hedge, dict) and hedge.get("symbol"):
+            seen.setdefault(str(hedge["symbol"]), None)
+    return list(seen.keys())
+
+
+@stbt_bp.route("/api/panic/<strategy_id>", methods=["POST"])
+@check_session_validity
+def panic_close(strategy_id):
+    """PANIC: stop the strategy and force-flatten every position it holds.
+
+    Works independently of the engine subprocess (which may be hung) — the
+    blueprint places the closing orders directly via placesmartorder to
+    position_size=0 for each held symbol. Idempotent: already-flat symbols are
+    no-ops. This is the operator's emergency square-off + kill switch.
+    """
+    user_id = session.get("user")
+    entry, error = _verify_stbt(strategy_id, user_id)
+    if error:
+        return error
+
+    # 1. Stop the running process FIRST so the engine cannot re-enter while we
+    #    flatten. Best-effort; a hung/dead process must not block the close.
+    if entry.get("is_running"):
+        try:
+            stop_strategy_process(strategy_id)
+        except Exception as exc:
+            logger.warning(f"panic: stop process failed for {strategy_id}: {exc}")
+    entry["manually_stopped"] = True  # prevent scheduler auto-restart
+    entry["is_running"] = False
+    save_configs()
+
+    # 2. Resolve what to close and how.
+    params = _read_json(_config_path(strategy_id)) or {}
+    underlying = str(params.get("underlying", "SENSEX")).upper()
+    opt_exchange = _OPT_EXCHANGE.get(underlying, "BFO")
+    product = str(params.get("product", "NRML")).upper()
+    strategy_tag = f"{underlying}_STBT"
+    symbols = _open_symbols(strategy_id)
+
+    api_key = get_api_key_for_tradingview(user_id)
+    if not api_key:
+        return jsonify(
+            {"status": "error", "message": "No API key for this user — cannot place close orders"}
+        ), 400
+
+    # 3. Flatten each symbol to zero (position-size reconcile). Idempotent.
+    closed, already_flat, failed = [], [], []
+    for symbol in symbols:
+        order = {
+            "strategy": strategy_tag,
+            "symbol": symbol,
+            "exchange": opt_exchange,
+            "action": "BUY",  # real side derived from the position sign
+            "quantity": 0,  # 0 makes the already-flat case a true no-op
+            "position_size": 0,
+            "product": product,
+            "pricetype": "MARKET",
+        }
+        try:
+            success, resp, _code = place_smart_order(order, api_key=api_key)
+            msg = str((resp or {}).get("message", "")).lower()
+            if success and ("matched" in msg or "no action" in msg):
+                already_flat.append(symbol)
+            elif success:
+                closed.append(symbol)
+            else:
+                failed.append(symbol)
+                logger.error(f"panic: flatten failed for {symbol}: {resp}")
+        except Exception as exc:
+            failed.append(symbol)
+            logger.exception(f"panic: flatten exception for {symbol}: {exc}")
+
+    # 4. Clear the persisted state only if nothing failed — a failed close means
+    #    a position may remain, so keep state for the operator + a restart.
+    if not failed:
+        for p in (_state_path(strategy_id), _status_path(strategy_id)):
+            try:
+                if p.exists():
+                    p.unlink()
+            except OSError:
+                pass
+
+    status = "success" if not failed else "partial"
+    logger.info(
+        f"panic close {strategy_id}: closed={closed} already_flat={already_flat} failed={failed}"
+    )
+    return jsonify(
+        {
+            "status": status,
+            "closed": closed,
+            "already_flat": already_flat,
+            "failed": failed,
+            "message": (
+                f"Closed {len(closed)}, {len(already_flat)} already flat"
+                if not failed
+                else f"{len(failed)} FAILED — check broker positions now"
+            ),
         }
     )
