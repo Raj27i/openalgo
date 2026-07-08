@@ -60,7 +60,7 @@ from openalgo import api
 #  CONFIGURATION  — loaded from strategies/stbt/{STRATEGY_ID}_config.json
 # ─────────────────────────────────────────────────────────────────────────────
 
-VERSION = "3.4.0"
+VERSION = "3.5.0"
 
 IST = ZoneInfo("Asia/Kolkata")
 
@@ -1358,6 +1358,79 @@ def _take_profit_exit(main_legs: list, hedge, expiry: str, save_cb) -> None:
         )
 
 
+def _broker_net_qty(symbol: str) -> int | None:
+    """Net position quantity for `symbol` at the broker (via the openalgo
+    openposition API). Returns 0 = flat, signed int = held, None = lookup
+    failed. On None the caller stays conservative and does NOT assume flat."""
+    try:
+        resp = client.openposition(
+            strategy=STRATEGY, symbol=symbol, exchange=OPT_EXCHANGE, product=PRODUCT
+        )
+        if isinstance(resp, dict) and resp.get("status") == "success":
+            return int(float(resp.get("quantity", 0) or 0))
+        log.warning("[RECONCILE] openposition non-success for %s: %s", symbol, resp)
+        return None
+    except Exception as exc:
+        log.warning("[RECONCILE] openposition failed for %s: %s", symbol, exc)
+        return None
+
+
+def _reconcile_with_broker(main_legs: list, hedge, save_cb) -> None:
+    """Align engine belief with actual broker positions at Day-2 start.
+
+    A leg/hedge the state file believes is open but the broker shows FLAT was
+    closed externally overnight (manual square-off, other tooling) — mark it
+    DONE so we neither monitor nor place any order on a phantom. Best-effort:
+    on a lookup failure we leave the state unchanged; the idempotent
+    smart-order exits still reconcile at exit time as the safety net."""
+    changed = False
+    for leg in main_legs:
+        if leg.state != MainLeg.IN_SHORT:
+            continue
+        net = _broker_net_qty(leg.symbol)
+        if net is None:
+            log.info(
+                "[RECONCILE] %s %s: broker lookup failed — keeping IN_SHORT.",
+                leg.opt_type,
+                leg.symbol,
+            )
+            continue
+        if net == 0:
+            log.warning(
+                "[RECONCILE] %s %s: engine=IN_SHORT but broker FLAT — closed "
+                "externally. Marking DONE (no order placed).",
+                leg.opt_type,
+                leg.symbol,
+            )
+            _notify(
+                f"Startup reconcile: {leg.opt_type} {leg.symbol} already flat at broker "
+                "(closed externally) — leg marked closed, not monitored."
+            )
+            leg.state = MainLeg.DONE
+            changed = True
+        else:
+            log.info(
+                "[RECONCILE] %s %s: broker net=%d — position confirmed, monitoring.",
+                leg.opt_type,
+                leg.symbol,
+                net,
+            )
+    if hedge and hedge.state == HedgeLeg.OPEN:
+        net = _broker_net_qty(hedge.symbol)
+        if net is not None and net == 0:
+            log.warning(
+                "[RECONCILE] hedge %s: engine=OPEN but broker FLAT — marking DONE.",
+                hedge.symbol,
+            )
+            _notify(
+                f"Startup reconcile: hedge {hedge.symbol} already flat at broker — marked closed."
+            )
+            hedge.state = HedgeLeg.DONE
+            changed = True
+    if changed:
+        save_cb()
+
+
 def save_state(main_legs: list, hedge, expiry: str):
     payload = {
         "version": VERSION,
@@ -2326,6 +2399,13 @@ def run_day2():
     log.info("=" * 60)
     log.info("DAY-2  %02d:%02d  %s STBT Exit Session", DAY2_H, DAY2_M, UNDERLYING)
     log.info("=" * 60)
+
+    # Step 0 — reconcile engine belief with actual broker positions before
+    # acting. Anything closed externally overnight is marked DONE now, so we
+    # neither monitor nor try to close a phantom (which, on the placeorder
+    # fallback, would have opened a wrong-direction position).
+    _reconcile_with_broker(main_legs, hedge, _save)
+    active = [leg for leg in main_legs if not leg.is_done]
 
     # Step 1 — sell hedge at market (REST, no WS needed yet)
     if hedge and not hedge.is_done:
