@@ -72,6 +72,7 @@ _NUMERIC_PARAMS = {
     "hedge_target_premium": (float, 1.0, 1000.0),
     "lot_multiplier": (int, 1, 100),
     "max_loss": (float, 0.0, 10_000_000.0),  # session kill switch ₹; 0 = disabled
+    "take_profit_pct": (float, 0.0, 99.0),  # combined profit target %; 0 = disabled
 }
 _TIME_PARAMS = ("entry_time", "hedge_time", "ws_close_time", "day2_open_time", "force_exit_time")
 _REENTRY_METHODS = {"CANDLE_CLOSE", "LTP"}

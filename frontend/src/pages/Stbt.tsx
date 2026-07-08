@@ -68,6 +68,7 @@ interface FormState {
   hedge_target_premium: string
   lot_multiplier: string
   max_loss: string
+  take_profit_pct: string
   telegram_alerts: boolean
   reentry_method: 'CANDLE_CLOSE' | 'LTP'
   allow_day2_reentry: boolean
@@ -90,6 +91,7 @@ const DEFAULT_FORM: FormState = {
   hedge_target_premium: '20',
   lot_multiplier: '1',
   max_loss: '0',
+  take_profit_pct: '0',
   telegram_alerts: true,
   reentry_method: 'CANDLE_CLOSE',
   allow_day2_reentry: true,
@@ -114,6 +116,7 @@ function formFromConfig(config: StbtConfig): FormState {
     hedge_target_premium: String(p.hedge_target_premium ?? 20),
     lot_multiplier: String(p.lot_multiplier ?? 1),
     max_loss: String(p.max_loss ?? 0),
+    take_profit_pct: String(p.take_profit_pct ?? 0),
     telegram_alerts: p.telegram_alerts ?? true,
     reentry_method: p.reentry_method === 'LTP' ? 'LTP' : 'CANDLE_CLOSE',
     allow_day2_reentry: p.allow_day2_reentry ?? true,
@@ -140,6 +143,7 @@ function payloadFromForm(form: FormState): StbtConfigPayload {
     hedge_target_premium: Number(form.hedge_target_premium),
     lot_multiplier: Number(form.lot_multiplier),
     max_loss: Number(form.max_loss),
+    take_profit_pct: Number(form.take_profit_pct),
     telegram_alerts: form.telegram_alerts,
     reentry_method: form.reentry_method,
     allow_day2_reentry: form.allow_day2_reentry,
@@ -740,6 +744,11 @@ export default function Stbt() {
                     {(config.params?.max_loss ?? 0) > 0 && (
                       <span className="text-red-500/80">max loss ₹{config.params?.max_loss}</span>
                     )}
+                    {(config.params?.take_profit_pct ?? 0) > 0 && (
+                      <span className="text-green-600/80">
+                        target {config.params?.take_profit_pct}%
+                      </span>
+                    )}
                   </div>
                   {status && <LivePanel status={status} />}
                   <HistorySection strategyId={config.strategy_id} />
@@ -804,6 +813,11 @@ export default function Stbt() {
             })}
             {numberField('Lot multiplier', 'lot_multiplier', { step: '1', min: '1', max: '100' })}
             {numberField('Max loss ₹ (0 = off)', 'max_loss', { step: '500', min: '0' })}
+            {numberField('Take profit % (0 = off)', 'take_profit_pct', {
+              step: '5',
+              min: '0',
+              max: '99',
+            })}
 
             <div className="space-y-1.5">
               <Label>Re-entry method</Label>

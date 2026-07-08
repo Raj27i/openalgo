@@ -60,7 +60,7 @@ from openalgo import api
 #  CONFIGURATION  — loaded from strategies/stbt/{STRATEGY_ID}_config.json
 # ─────────────────────────────────────────────────────────────────────────────
 
-VERSION = "3.3.0"
+VERSION = "3.4.0"
 
 IST = ZoneInfo("Asia/Kolkata")
 
@@ -110,6 +110,7 @@ _CONFIG_DEFAULTS = {
     "check_next_day_after": "09:16",
     "hedge_target_premium": 20.0,  # buy OTM strike whose LTP is closest to this
     "max_loss": 0.0,  # session kill switch in ₹ (0 = disabled)
+    "take_profit_pct": 0.0,  # combined profit-target %; book out flat (0 = off)
     "telegram_alerts": True,  # strategy-level Telegram notifications
     "use_smart_exit": True,  # exits via placesmartorder (idempotent flatten)
     "user_id": "",  # owner username (written by blueprints/stbt.py)
@@ -183,6 +184,7 @@ CHECK_NEXT_DAY_AFTER_H, CHECK_NEXT_DAY_AFTER_M = _hhmm(_CFG["check_next_day_afte
 
 HEDGE_TARGET_PREMIUM = float(_CFG["hedge_target_premium"])
 MAX_LOSS = float(_CFG["max_loss"])  # 0 = kill switch disabled
+TAKE_PROFIT_PCT = float(_CFG["take_profit_pct"])  # combined target %; 0 = disabled
 TELEGRAM_ALERTS = bool(_CFG["telegram_alerts"])
 USE_SMART_EXIT = bool(_CFG["use_smart_exit"])  # exits reconcile to flat via smart order
 OWNER_USER_ID = str(_CFG["user_id"] or "")
@@ -1286,6 +1288,76 @@ def _kill_session(main_legs: list, hedge, expiry: str, save_cb, total: float) ->
         )
 
 
+def _combined_target_hit(main_legs: list) -> bool:
+    """True when the currently-open short legs have jointly captured
+    TAKE_PROFIT_PCT of their premium (combined LTP decayed to
+    (1 - pct) of combined entry). Never acts on incomplete tick data."""
+    open_legs = [leg for leg in main_legs if leg.is_short]
+    if not open_legs:
+        return False
+    ltps = {leg: live_ltp(leg.symbol) for leg in open_legs}
+    if any(v <= 0 for v in ltps.values()):
+        return False
+    entry_sum = sum(leg.entry_price * leg.quantity for leg in open_legs)
+    cur_sum = sum(ltps[leg] * leg.quantity for leg in open_legs)
+    if entry_sum <= 0:
+        return False
+    captured = 1.0 - (cur_sum / entry_sum)
+    return captured >= TAKE_PROFIT_PCT / 100.0
+
+
+def _take_profit_exit(main_legs: list, hedge, expiry: str, save_cb) -> None:
+    """Combined profit-target book-out: close every open leg + hedge at market
+    and end the session FLAT (no overnight carry). Mirrors _kill_session but for
+    a win. On Day-1 the caller returns before the hedge window, so nothing is
+    carried."""
+    log.info("[TARGET] Combined profit target %.0f%% hit — booking out flat.", TAKE_PROFIT_PCT)
+    _notify(
+        f"PROFIT TARGET {TAKE_PROFIT_PCT:.0f}% hit — closing all positions at market, "
+        "no overnight carry."
+    )
+
+    for leg in main_legs:
+        if leg.is_short:
+            leg._close_at_market(save_cb, "TP", f"{leg.opt_type}-TARGET")
+    if hedge and not hedge.is_done:
+        hedge.exit_at_market(save_cb)
+
+    open_legs = [leg for leg in main_legs if leg.is_short]
+    hedge_open = hedge is not None and not hedge.is_done
+
+    try:
+        ws_unsubscribe([leg.symbol for leg in main_legs])
+    except Exception:
+        pass
+
+    _log_pnl_summary(main_legs, hedge, label="TARGET")
+    _append_history("TARGET", main_legs, hedge, expiry)
+    _set_phase(
+        "TARGET_HIT",
+        main_legs,
+        hedge,
+        expiry,
+        message=f"Profit target {TAKE_PROFIT_PCT:.0f}% hit — booked out flat",
+    )
+
+    if not open_legs and not hedge_open:
+        delete_state()
+        _notify(
+            f"Profit target complete — booked out flat. "
+            f"Net ₹{_total_net(main_legs, hedge):,.2f}"
+        )
+    else:
+        save_cb()
+        log.critical(
+            "[TARGET] *** Some exits FAILED — positions remain at broker. MANUAL ACTION REQUIRED. ***"
+        )
+        _notify(
+            "PROFIT TARGET WARNING: some exits FAILED — check broker "
+            "positions NOW (manual action required)."
+        )
+
+
 def save_state(main_legs: list, hedge, expiry: str):
     payload = {
         "version": VERSION,
@@ -1795,24 +1867,25 @@ class MainLeg:
         save_cb()
         return True
 
-    def force_exit(self, save_cb) -> bool:
-        """Market BUY to close short with critical-level retries."""
+    def _close_at_market(self, save_cb, reason: str, label: str) -> bool:
+        """Market BUY-to-close the short with critical retries and book the
+        cycle under `reason` (FORCE, TP, …). Shared by force-exit and the
+        combined profit-target book-out."""
         if self.state != self.IN_SHORT:
             self.state = self.DONE
             save_cb()
             return True
-        log.info("[%s] Force-exit at %02d:%02d.", self.opt_type, EXIT_H, EXIT_M)
 
         if USE_SMART_EXIT:
-            oid, outcome = _smart_flatten(self.symbol, f"{self.opt_type}-FORCE_EXIT", critical=True)
+            oid, outcome = _smart_flatten(self.symbol, label, critical=True)
             if outcome == "flat":
                 # Already flat — nothing left to close. Drift recovered.
                 self.state = self.DONE
                 log.warning(
-                    "[%s] Force-exit: position already flat (drift recovered).", self.opt_type
+                    "[%s] %s: position already flat (drift recovered).", self.opt_type, reason
                 )
                 _notify(
-                    f"Force-exit {self.opt_type} {self.symbol}: broker already flat "
+                    f"{reason} {self.opt_type} {self.symbol}: broker already flat "
                     "(drift recovered) — leg closed."
                 )
                 save_cb()
@@ -1824,12 +1897,7 @@ class MainLeg:
                 oid, self.symbol, live_ltp(self.symbol) or self.entry_price
             )
         else:
-            oid = _place_critical_order(
-                self.symbol,
-                "BUY",
-                self.quantity,
-                label=f"{self.opt_type}-FORCE_EXIT",
-            )
+            oid = _place_critical_order(self.symbol, "BUY", self.quantity, label=label)
             if not oid:
                 save_cb()  # keep IN_SHORT so operator knows position is still live
                 return False
@@ -1837,11 +1905,16 @@ class MainLeg:
                 oid, self.symbol, live_ltp(self.symbol) or self.entry_price
             )
 
-        self._log_cycle_pnl(exit_price, "FORCE")
+        self._log_cycle_pnl(exit_price, reason)
         self.state = self.DONE
-        _notify(f"Force-exited {self.opt_type} {self.symbol} @ ₹{exit_price:.2f}")
+        _notify(f"Closed {self.opt_type} {self.symbol} @ ₹{exit_price:.2f} ({reason})")
         save_cb()
         return True
+
+    def force_exit(self, save_cb) -> bool:
+        """Market BUY to close short with critical-level retries."""
+        log.info("[%s] Force-exit at %02d:%02d.", self.opt_type, EXIT_H, EXIT_M)
+        return self._close_at_market(save_cb, "FORCE", f"{self.opt_type}-FORCE_EXIT")
 
     @property
     def is_done(self) -> bool:
@@ -2105,6 +2178,10 @@ def run_day1():
 
         _maybe_refresh_status(main_legs, hedge, expiry)
 
+        if TAKE_PROFIT_PCT > 0 and _combined_target_hit(main_legs):
+            _take_profit_exit(main_legs, hedge, expiry, _save)
+            return
+
         if MAX_LOSS > 0 and any(leg.is_short for leg in main_legs):
             total = _total_net(main_legs, hedge)
             if total <= -MAX_LOSS:
@@ -2329,6 +2406,10 @@ def run_day2():
                             leg.on_candle_close(candle_minute, candle_close, _save)
 
         _maybe_refresh_status(main_legs, hedge, expiry)
+
+        if TAKE_PROFIT_PCT > 0 and _combined_target_hit(main_legs):
+            _take_profit_exit(main_legs, hedge, expiry, _save)
+            return
 
         if MAX_LOSS > 0 and any(leg.is_short for leg in main_legs):
             total = _total_net(main_legs, hedge)

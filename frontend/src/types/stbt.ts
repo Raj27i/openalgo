@@ -11,6 +11,7 @@ export interface StbtParams {
   hedge_target_premium?: number
   lot_multiplier?: number
   max_loss?: number
+  take_profit_pct?: number
   telegram_alerts?: boolean
   entry_time?: string
   hedge_time?: string
@@ -199,6 +200,7 @@ export const PHASE_LABELS: Record<string, string> = {
   EXPIRY_DAY: 'Expiry day — no new positions',
   DONE: 'Session finished',
   KILLED: 'KILLED — max loss hit',
+  TARGET_HIT: 'Target hit — booked out flat',
   ERROR: 'Engine error — check logs',
 }
 
