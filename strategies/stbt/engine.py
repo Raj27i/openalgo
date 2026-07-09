@@ -2375,15 +2375,24 @@ def run_day2():
     hedge = HedgeLeg.from_dict(state["hedge"]) if state.get("hedge") else None
     expiry = state["expiry"]
     trade_date = state.get("trade_date")
-    active = [leg for leg in main_legs if not leg.is_done]
-
-    if not active and (hedge is None or hedge.is_done):
-        log.info("[DAY-2] All positions already closed.")
-        delete_state()
-        return
 
     def _save():
         save_state(main_legs, hedge, expiry)
+
+    # Reconcile with the broker at process start (~09:10, pre-open). A position
+    # read needs no live market, so we do it BEFORE the 09:16 wait: anything
+    # closed externally overnight is marked DONE now, and if EVERYTHING is
+    # already flat we finish immediately instead of idling until 09:16. Only the
+    # price-sensitive actions (hedge sell, SL monitoring) wait for 09:16 to skip
+    # the open spike.
+    _reconcile_with_broker(main_legs, hedge, _save)
+    active = [leg for leg in main_legs if not leg.is_done]
+
+    if not active and (hedge is None or hedge.is_done):
+        log.info("[DAY-2] All positions already closed (reconciled flat at startup).")
+        delete_state()
+        _set_phase("DONE", main_legs, hedge, expiry, message="Nothing open — session complete")
+        return
 
     _set_phase(
         "DAY2",
@@ -2400,14 +2409,8 @@ def run_day2():
     log.info("DAY-2  %02d:%02d  %s STBT Exit Session", DAY2_H, DAY2_M, UNDERLYING)
     log.info("=" * 60)
 
-    # Step 0 — reconcile engine belief with actual broker positions before
-    # acting. Anything closed externally overnight is marked DONE now, so we
-    # neither monitor nor try to close a phantom (which, on the placeorder
-    # fallback, would have opened a wrong-direction position).
-    _reconcile_with_broker(main_legs, hedge, _save)
-    active = [leg for leg in main_legs if not leg.is_done]
-
-    # Step 1 — sell hedge at market (REST, no WS needed yet)
+    # Step 1 — sell hedge at market (REST, no WS needed yet). Positions were
+    # already reconciled with the broker at process start (before the wait).
     if hedge and not hedge.is_done:
         hedge.exit_at_market(_save)
 
