@@ -81,7 +81,9 @@ interface FormState {
   drop_pct: string
   vsl_pct: string
   real_sl_pct: string
+  be_trigger_pct: string
   vix_max: string
+  candle_source: 'WS' | 'HISTORY'
   dte_min: string
   dte_max: string
   entry_weekdays: string[]
@@ -117,7 +119,9 @@ const DEFAULT_FORM: FormState = {
   drop_pct: '5',
   vsl_pct: '20',
   real_sl_pct: '30',
+  be_trigger_pct: '30',
   vix_max: '18',
+  candle_source: 'WS',
   dte_min: '1',
   dte_max: '3',
   entry_weekdays: ['mon', 'tue', 'wed', 'thu'],
@@ -154,7 +158,9 @@ function formFromConfig(config: StbtConfig): FormState {
     drop_pct: String(p.drop_pct ?? 5),
     vsl_pct: String(p.vsl_pct ?? 20),
     real_sl_pct: String(p.real_sl_pct ?? 30),
+    be_trigger_pct: String(p.be_trigger_pct ?? 30),
     vix_max: String(p.vix_max ?? 18),
+    candle_source: p.candle_source === 'HISTORY' ? 'HISTORY' : 'WS',
     dte_min: String(p.dte_min ?? 1),
     dte_max: String(p.dte_max ?? 3),
     entry_weekdays: p.entry_weekdays?.length ? p.entry_weekdays : ['mon', 'tue', 'wed', 'thu'],
@@ -197,7 +203,9 @@ function payloadFromForm(form: FormState): StbtConfigPayload {
       drop_pct: Number(form.drop_pct),
       vsl_pct: Number(form.vsl_pct),
       real_sl_pct: Number(form.real_sl_pct),
+      be_trigger_pct: Number(form.be_trigger_pct),
       vix_max: Number(form.vix_max),
+      candle_source: form.candle_source,
       dte_min: Number(form.dte_min),
       dte_max: Number(form.dte_max),
       entry_weekdays: form.entry_weekdays,
@@ -251,6 +259,7 @@ function LegRow({ leg }: { leg: StbtLeg }) {
             <>
               entry ₹{leg.entry_price.toFixed(2)} · SL ₹{leg.sl_price.toFixed(2)}
               {isOpen && (leg.ltp ?? 0) > 0 && <> · LTP ₹{(leg.ltp ?? 0).toFixed(2)}</>}
+              {leg.be_armed && <> · BE armed</>}
               {leg.reentries !== undefined && <> · re-entries {leg.reentries}</>}
             </>
           )}
@@ -822,6 +831,9 @@ export default function Stbt() {
                         <span>drop {config.params?.drop_pct ?? 5}%</span>
                         <span>flip +{config.params?.vsl_pct ?? 20}%</span>
                         <span>SL {config.params?.real_sl_pct ?? 30}%</span>
+                        {(config.params?.be_trigger_pct ?? 0) > 0 && (
+                          <span>BE +{config.params?.be_trigger_pct ?? 30}% (D2)</span>
+                        )}
                         {(config.params?.vix_max ?? 0) > 0 && (
                           <span>VIX ≤ {config.params?.vix_max ?? 18}</span>
                         )}
@@ -950,6 +962,11 @@ export default function Stbt() {
                   min: '1',
                   max: '99',
                 })}
+                {numberField('Breakeven arm % (0 = off)', 'be_trigger_pct', {
+                  step: '5',
+                  min: '0',
+                  max: '200',
+                })}
                 {numberField('Max India VIX (0 = off)', 'vix_max', {
                   step: '0.5',
                   min: '0',
@@ -958,6 +975,27 @@ export default function Stbt() {
                 {numberField('Min DTE', 'dte_min', { step: '1', min: '1', max: '30' })}
                 {numberField('Max DTE', 'dte_max', { step: '1', min: '1', max: '30' })}
                 {numberField('Max loss ₹ (0 = off)', 'max_loss', { step: '500', min: '0' })}
+
+                <div className="space-y-1.5">
+                  <Label>Signal candle source</Label>
+                  <Select
+                    value={form.candle_source}
+                    onValueChange={(value) =>
+                      setForm((prev) => ({
+                        ...prev,
+                        candle_source: value as FormState['candle_source'],
+                      }))
+                    }
+                  >
+                    <SelectTrigger>
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="WS">WebSocket ticks (live feed)</SelectItem>
+                      <SelectItem value="HISTORY">History API (official 1-min close)</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
 
                 <div className="space-y-1.5 sm:col-span-2">
                   <Label>Entry days (Friday off = weekend theta filter)</Label>

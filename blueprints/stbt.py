@@ -85,6 +85,7 @@ _NUMERIC_PARAMS = {
         "drop_pct": (float, 0.0, 50.0),  # paper-short trigger
         "vsl_pct": (float, 1.0, 200.0),  # virtual SL distance → real-buy trigger
         "real_sl_pct": (float, 1.0, 99.0),  # SL below the bought premium
+        "be_trigger_pct": (float, 0.0, 200.0),  # D2 breakeven arm level; 0 = off
         "vix_max": (float, 0.0, 100.0),  # India VIX entry ceiling; 0 = disabled
         "dte_min": (int, 1, 30),
         "dte_max": (int, 1, 30),
@@ -104,6 +105,7 @@ _TIME_PARAMS = {
     ),
 }
 _REENTRY_METHODS = {"CANDLE_CLOSE", "LTP"}
+_CANDLE_SOURCES = {"WS", "HISTORY"}  # btst signal-candle source
 
 LAUNCHER_TEMPLATE = '''#!/usr/bin/env python
 """Auto-generated STBT launcher — managed by the /stbt tab.
@@ -249,6 +251,12 @@ def _validate_params(
 
         if "allow_day2_reentry" in data and data["allow_day2_reentry"] is not None:
             clean["allow_day2_reentry"] = bool(data["allow_day2_reentry"])
+
+    if strategy_type == "btst" and data.get("candle_source"):
+        source = str(data["candle_source"]).upper().strip()
+        if source not in _CANDLE_SOURCES:
+            return {}, f"candle_source must be one of {sorted(_CANDLE_SOURCES)}"
+        clean["candle_source"] = source
 
     if strategy_type == "btst" and data.get("entry_weekdays") is not None:
         days = data["entry_weekdays"]

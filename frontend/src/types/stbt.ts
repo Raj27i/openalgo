@@ -22,7 +22,9 @@ export interface StbtParams {
   drop_pct?: number
   vsl_pct?: number
   real_sl_pct?: number
+  be_trigger_pct?: number
   vix_max?: number
+  candle_source?: 'WS' | 'HISTORY'
   dte_min?: number
   dte_max?: number
   entry_weekdays?: string[]
@@ -74,9 +76,10 @@ export interface StbtLeg {
   entry_price: number
   sl_price: number
   reentries?: number
-  // BTST flip legs: the virtual paper-short levels
+  // BTST flip legs: the virtual paper-short levels + breakeven stop
   v_entry?: number
   v_sl?: number
+  be_armed?: boolean
   realized_pnl: number
   charges_total: number
   ltp?: number

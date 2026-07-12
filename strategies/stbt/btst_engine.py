@@ -23,8 +23,13 @@
 #           fire on a later candle once VIX cools). Max 1 entry per day.
 #    3. Risk: real_sl_pct% stop-loss below the buy premium — live on ticks
 #       Day-1, across the overnight gap, and Day-2 morning.
+#    4. Breakeven arming: once the premium CLOSES ≥ entry × (1 + be_trigger%),
+#       the breakeven stop is ARMED (any day). Day-1 pullbacks to entry are
+#       tolerated; the stop only acts on Day 2+.
 #  DAY-1  ws close (default 15:29) — disconnect WS; persist state if long.
 #  DAY-2  open (default 09:16)     — reconcile with broker, resume SL watch.
+#         If breakeven is armed and the premium closes ≤ entry → exit at
+#         market (a Day-2 giveback is a dying trade).
 #  DAY-2  force exit (default 10:30) — SELL the position at market; cleanup.
 #  EXPIRY DAY — skip Day-1 (cannot hold overnight); Day-2 exit only.
 #
@@ -49,7 +54,7 @@ from openalgo import api
 #  CONFIGURATION  — loaded from strategies/stbt/{STRATEGY_ID}_config.json
 # ─────────────────────────────────────────────────────────────────────────────
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 IST = ZoneInfo("Asia/Kolkata")
 
@@ -90,7 +95,9 @@ _CONFIG_DEFAULTS = {
     "drop_pct": 5.0,  # paper-short trigger: % drop from reference
     "vsl_pct": 20.0,  # paper-short SL distance → real BUY trigger
     "real_sl_pct": 30.0,  # stop-loss % below the bought premium
+    "be_trigger_pct": 30.0,  # arm breakeven at entry × (1 + this%); 0 = off
     "vix_max": 18.0,  # no entries while India VIX above this (0 = off)
+    "candle_source": "WS",  # 1-min candle closes: WS ticks first | HISTORY API first
     "dte_min": 1,  # allowed days-to-expiry window for entries
     "dte_max": 3,
     "entry_weekdays": ["mon", "tue", "wed", "thu"],  # no Friday entries
@@ -160,6 +167,8 @@ MONEYNESS = int(_CFG["moneyness"])
 DROP_PCT = float(_CFG["drop_pct"])
 VSL_PCT = float(_CFG["vsl_pct"])
 REAL_SL_PCT = float(_CFG["real_sl_pct"])
+BE_TRIGGER_PCT = float(_CFG["be_trigger_pct"])
+CANDLE_SOURCE = str(_CFG["candle_source"]).upper()  # WS | HISTORY
 VIX_MAX = float(_CFG["vix_max"])
 DTE_MIN = int(_CFG["dte_min"])
 DTE_MAX = int(_CFG["dte_max"])
@@ -1085,7 +1094,19 @@ def get_last_closed_1m_candle(symbol: str) -> tuple[str, float] | None:
 
 
 def latest_closed_candle(symbol: str) -> tuple[str, float] | None:
-    """Latest closed 1-min candle — history API first, WS-derived fallback."""
+    """Latest closed 1-min candle for the entry/breakeven signals.
+
+    candle_source='WS' (default): the candle is built from live WebSocket
+    ticks (`_update_minute_candle` — same feed the SL runs on); the history
+    API is only the fallback for minutes where the WS produced no closed
+    candle yet (slow-ticking BFO strikes right after subscribe, stale feed).
+    candle_source='HISTORY': the broker's official 1-min close is preferred
+    and WS is the fallback (StockMock-style, like the STBT re-entry)."""
+    if CANDLE_SOURCE == "WS":
+        closed = _get_last_closed_candle(symbol)
+        if closed is None:
+            closed = get_last_closed_1m_candle(symbol)
+        return closed
     closed = get_last_closed_1m_candle(symbol)
     if closed is None:
         closed = _get_last_closed_candle(symbol)
@@ -1365,11 +1386,14 @@ class FlipLeg:
     WATCHING    ──(close ≤ ref × (1 − drop%))────────► PAPER_SHORT
     PAPER_SHORT ──(close ≥ v_sl AND VIX ok)──────────► IN_LONG   (real BUY)
     IN_LONG     ──(LTP ≤ entry × (1 − real_sl%))─────► DONE      (SL sell)
+    IN_LONG     ──(BE armed, Day-2 close ≤ entry)────► DONE      (BE sell)
     IN_LONG     ──(Day-2 force exit)─────────────────► DONE
     WATCHING / PAPER_SHORT ──(entry window ends)─────► DONE      (no trade)
 
     Signals evaluate on 1-minute candle CLOSES (backtest fidelity); the real
-    stop-loss runs on live ticks (≈ the backtest's bar high/low basis).
+    stop-loss runs on live ticks (≈ the backtest's bar high/low basis). The
+    breakeven stop arms on a close ≥ entry × (1 + be_trigger%) on ANY day but
+    only exits on Day 2+ — Day-1 pullbacks to entry are tolerated.
     Max one entry per day — no re-entry after the SL.
     """
 
@@ -1388,6 +1412,8 @@ class FlipLeg:
         self.v_sl = 0.0  # paper-short virtual SL = real-BUY trigger
         self.entry_price = 0.0  # real BUY fill
         self.sl_price = 0.0  # real SL = entry × (1 − REAL_SL_PCT/100)
+        self.entry_date = ""  # ISO date of the real BUY (drives Day-2 logic)
+        self.be_armed = False  # breakeven stop armed (survives overnight)
         self.last_signal_candle = ""  # dedupe candle-close evaluations
         self.realized_pnl = 0.0
         self.charges_total = 0.0
@@ -1401,6 +1427,8 @@ class FlipLeg:
         leg.v_sl = d.get("v_sl", 0.0)
         leg.entry_price = d.get("entry_price", 0.0)
         leg.sl_price = d.get("sl_price", 0.0)
+        leg.entry_date = d.get("entry_date", "")
+        leg.be_armed = bool(d.get("be_armed", False))
         leg.last_signal_candle = d.get("last_signal_candle", "")
         leg.realized_pnl = d.get("realized_pnl", 0.0)
         leg.charges_total = d.get("charges_total", 0.0)
@@ -1417,6 +1445,8 @@ class FlipLeg:
             "v_sl": self.v_sl,
             "entry_price": self.entry_price,
             "sl_price": self.sl_price,
+            "entry_date": self.entry_date,
+            "be_armed": self.be_armed,
             "last_signal_candle": self.last_signal_candle,
             "realized_pnl": self.realized_pnl,
             "charges_total": self.charges_total,
@@ -1520,6 +1550,8 @@ class FlipLeg:
         filled = _get_fill_price(oid, self.symbol, ref_ltp)
         self.entry_price = filled
         self.sl_price = round(filled * (1 - REAL_SL_PCT / 100.0), 2)
+        self.entry_date = _now_ist().date().isoformat()
+        self.be_armed = False  # fresh position → fresh breakeven state
         self.state = self.IN_LONG
         log.info(
             "[%s] LONG entered  entry=%.2f  sl=%.2f  qty=%d",
@@ -1543,6 +1575,47 @@ class FlipLeg:
             return False
         log.info("[%s] STOP-LOSS: LTP %.2f ≤ SL %.2f — exiting.", self.opt_type, ltp, self.sl_price)
         return self._close_at_market(save_cb, "SL", f"{self.opt_type}-SL")
+
+    def on_be_candle(self, close: float, save_cb) -> bool:
+        """Breakeven stop on 1-minute candle closes (backtest fidelity).
+
+        Arms on ANY day once close ≥ entry × (1 + BE_TRIGGER_PCT%). Exits at
+        market only on Day 2+ when the armed stop sees close ≤ entry — Day-1
+        pullbacks are tolerated (a plain any-day BE stop cost ₹44.5k of profit
+        in the backtest; the Day-2-only version cost ₹4.2k and cut max DD 18%).
+        """
+        if BE_TRIGGER_PCT <= 0:
+            return False
+        if self.state != self.IN_LONG or close <= 0 or self.entry_price <= 0:
+            return False
+
+        if not self.be_armed and close >= self.entry_price * (1 + BE_TRIGGER_PCT / 100.0):
+            self.be_armed = True
+            log.info(
+                "[%s] BREAKEVEN ARMED: close %.2f ≥ entry %.2f × %.2f.",
+                self.opt_type,
+                close,
+                self.entry_price,
+                1 + BE_TRIGGER_PCT / 100.0,
+            )
+            _notify(
+                f"Breakeven armed on {self.symbol}: premium touched "
+                f"+{BE_TRIGGER_PCT:.0f}% (₹{close:.2f}). Day-2 giveback to entry "
+                f"₹{self.entry_price:.2f} will exit."
+            )
+            save_cb()
+            return False
+
+        is_day2 = bool(self.entry_date) and _now_ist().date().isoformat() > self.entry_date
+        if self.be_armed and is_day2 and close <= self.entry_price:
+            log.info(
+                "[%s] BREAKEVEN STOP: Day-2 close %.2f ≤ entry %.2f — dying trade, exiting.",
+                self.opt_type,
+                close,
+                self.entry_price,
+            )
+            return self._close_at_market(save_cb, "BE", f"{self.opt_type}-BE")
+        return False
 
     def _close_at_market(self, save_cb, reason: str, label: str) -> bool:
         """Close the long. Smart exit reconciles to flat (idempotent, safe on
@@ -1798,11 +1871,16 @@ def run_day1():
         ws_reconnect_if_stale([ce_sym])
         _wait_for_tick(timeout=1)
 
-        # Real SL on live ticks (bar-low fidelity, conservative).
+        # Real SL on live ticks (bar-low fidelity, conservative); breakeven
+        # ARMS on candle closes (its exit branch is Day-2-gated, inert today).
         if leg.is_long:
             ltp = live_ltp(ce_sym)
             if ltp > 0:
                 leg.on_tick(ltp, _save)
+            if leg.is_long:
+                closed = latest_closed_candle(ce_sym)
+                if closed:
+                    leg.on_be_candle(closed[1], _save)
         # Flip signal on closed 1-minute candles inside the entry window.
         elif leg.state in (FlipLeg.WATCHING, FlipLeg.PAPER_SHORT):
             closed = latest_closed_candle(ce_sym)
@@ -1959,6 +2037,11 @@ def run_day2():
                 ltp = live_ltp(leg.symbol)
                 if ltp > 0:
                     leg.on_tick(ltp, _save)
+                # Breakeven stop: Day-2 giveback to entry = dying trade.
+                if leg.is_long:
+                    closed = latest_closed_candle(leg.symbol)
+                    if closed:
+                        leg.on_be_candle(closed[1], _save)
 
         _maybe_refresh_status(legs, expiry)
 
@@ -2013,6 +2096,16 @@ def _state_has_work(state: dict | None) -> bool:
     return any(leg.get("state") == FlipLeg.IN_LONG for leg in state.get("main_legs", []))
 
 
+def _state_entry_date(state: dict) -> str:
+    """Entry date of the held position. save_state stamps trade_date with the
+    SAVE date (today on every Day-2 persist), so day routing must use the
+    leg's own entry_date; trade_date is only the legacy fallback."""
+    for leg in state.get("main_legs", []):
+        if leg.get("state") == FlipLeg.IN_LONG and leg.get("entry_date"):
+            return str(leg["entry_date"])
+    return str(state.get("trade_date") or "")
+
+
 def main():
     if not API_KEY:
         log.error(
@@ -2058,18 +2151,19 @@ def main():
 
         today_iso = _now_ist().date().isoformat()
 
-        # Prior-day (or expiry-day) position → Day-2 exit first.
-        if state and state.get("trade_date") != today_iso:
-            log.info("Prior-day state found → Day-2 exit first.")
+        # Position entered on a PRIOR day → Day-2 exit first. Routing keys on
+        # the leg's entry_date (see _state_entry_date) so a mid-Day-2 restart
+        # still runs the 10:30 force exit.
+        if state and _state_entry_date(state) != today_iso:
+            log.info("Prior-day position found → Day-2 exit first.")
             run_day2()
             state = None  # deleted inside run_day2
 
-        # Today's state (mid-day restart while long) → resume Day-2-style
-        # SL monitoring via Day-1's loop is wrong (window math) — resume by
-        # re-entering run_day1 is also wrong. A same-day restart holding a
-        # long simply monitors SL until ws-close and re-persists.
-        if state and state.get("trade_date") == today_iso:
-            log.info("Today's state found (mid-day restart) → resuming SL monitoring.")
+        # Position entered TODAY (mid-day restart while long): re-entering
+        # run_day1 is wrong (window math), so just monitor the SL until
+        # ws-close and re-persist for tomorrow's Day-2.
+        if state and _state_entry_date(state) == today_iso:
+            log.info("Today's position found (mid-day restart) → resuming SL monitoring.")
             _resume_same_day(state)
             return
 
@@ -2134,6 +2228,10 @@ def _resume_same_day(state: dict):
                 ltp = live_ltp(leg.symbol)
                 if ltp > 0:
                     leg.on_tick(ltp, _save)
+                if leg.is_long:
+                    closed = latest_closed_candle(leg.symbol)
+                    if closed:
+                        leg.on_be_candle(closed[1], _save)
         _maybe_refresh_status(legs, expiry)
         if MAX_LOSS > 0 and any(leg.is_long for leg in legs):
             total = _total_net(legs)

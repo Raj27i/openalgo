@@ -218,6 +218,67 @@ class TestLongExit:
 
 
 # ---------------------------------------------------------------------------
+# Day-2-only breakeven stop (armed at +be_trigger_pct)
+# ---------------------------------------------------------------------------
+
+
+class TestBreakevenStop:
+    def test_arms_at_trigger_close(self, engine, leg, monkeypatch):
+        _go_long(engine, leg, monkeypatch, fill=1000.0)
+        assert leg.be_armed is False
+        # +29% close: not armed yet
+        assert leg.on_be_candle(1290.0, _noop_save) is False
+        assert leg.be_armed is False
+        # +30% close: armed
+        leg.on_be_candle(1300.0, _noop_save)
+        assert leg.be_armed is True
+
+    def test_day1_pullback_tolerated(self, engine, leg, monkeypatch):
+        _go_long(engine, leg, monkeypatch, fill=1000.0)
+        leg.on_be_candle(1300.0, _noop_save)  # arm (entry_date == today)
+        assert leg.be_armed is True
+        # Same-day giveback to entry: NO exit (Day-1 pullbacks are normal)
+        assert leg.on_be_candle(990.0, _noop_save) is False
+        assert leg.state == engine.FlipLeg.IN_LONG
+
+    def test_day2_giveback_exits(self, engine, leg, monkeypatch):
+        _go_long(engine, leg, monkeypatch, fill=1000.0)
+        leg.on_be_candle(1300.0, _noop_save)  # arm on Day-1
+        leg.entry_date = "2020-01-01"  # simulate Day-2 (entry was yesterday)
+        monkeypatch.setattr(engine, "_smart_flatten", lambda *a, **k: ("OID-BE", "placed"))
+        monkeypatch.setattr(engine, "_get_fill_price", lambda *_a: 998.0)
+        assert leg.on_be_candle(1000.0, _noop_save) is True
+        assert leg.state == engine.FlipLeg.DONE
+
+    def test_day2_no_exit_when_not_armed(self, engine, leg, monkeypatch):
+        _go_long(engine, leg, monkeypatch, fill=1000.0)
+        leg.entry_date = "2020-01-01"  # Day-2, never touched +30%
+        assert leg.on_be_candle(1000.0, _noop_save) is False
+        assert leg.state == engine.FlipLeg.IN_LONG
+
+    def test_day2_above_entry_no_exit(self, engine, leg, monkeypatch):
+        _go_long(engine, leg, monkeypatch, fill=1000.0)
+        leg.be_armed = True
+        leg.entry_date = "2020-01-01"
+        assert leg.on_be_candle(1001.0, _noop_save) is False
+        assert leg.state == engine.FlipLeg.IN_LONG
+
+    def test_disabled_when_zero(self, engine, leg, monkeypatch):
+        _go_long(engine, leg, monkeypatch, fill=1000.0)
+        monkeypatch.setattr(engine, "BE_TRIGGER_PCT", 0.0)
+        leg.entry_date = "2020-01-01"
+        assert leg.on_be_candle(1300.0, _noop_save) is False
+        assert leg.be_armed is False
+        assert leg.on_be_candle(900.0, _noop_save) is False
+        assert leg.state == engine.FlipLeg.IN_LONG
+
+    def test_fresh_buy_resets_be(self, engine, leg, monkeypatch):
+        _go_long(engine, leg, monkeypatch, fill=1000.0)
+        assert leg.be_armed is False
+        assert leg.entry_date != ""  # stamped at buy time
+
+
+# ---------------------------------------------------------------------------
 # State routing + entry-day filters
 # ---------------------------------------------------------------------------
 
@@ -235,8 +296,24 @@ class TestStateAndFilters:
         leg.ref_premium = 1000.0
         leg.v_entry = 950.0
         leg.v_sl = 1140.0
+        leg.be_armed = True
+        leg.entry_date = "2026-07-10"
         restored = engine.FlipLeg.from_dict(leg.to_dict())
         assert restored.to_dict() == leg.to_dict()
+
+    def test_state_entry_date_prefers_leg(self, engine):
+        # save_state stamps trade_date with the SAVE date — routing must use
+        # the leg's entry_date so a mid-Day-2 restart still force-exits.
+        state = {
+            "trade_date": "2026-07-11",  # saved during Day-2
+            "main_legs": [
+                {"state": "IN_LONG", "entry_date": "2026-07-10"},
+            ],
+        }
+        assert engine._state_entry_date(state) == "2026-07-10"
+        # Legacy state without entry_date falls back to trade_date
+        state_legacy = {"trade_date": "2026-07-11", "main_legs": [{"state": "IN_LONG"}]}
+        assert engine._state_entry_date(state_legacy) == "2026-07-11"
 
     def test_dte_filter(self, engine, monkeypatch):
         monkeypatch.setattr(engine, "_weekday_key", lambda *_a: "tue")
@@ -258,6 +335,25 @@ class TestStateAndFilters:
         allowed, reason = engine.entry_allowed_today()
         assert allowed is False
         assert "Friday" in reason or "entries" in reason
+
+    def test_candle_source_ws_first(self, engine, monkeypatch):
+        # Default WS mode: entry/BE candles come from the live tick feed;
+        # the history API is only the fallback when WS has no closed candle.
+        monkeypatch.setattr(engine, "CANDLE_SOURCE", "WS")
+        monkeypatch.setattr(engine, "_get_last_closed_candle", lambda *_a: ("m-ws", 101.0))
+        monkeypatch.setattr(
+            engine, "get_last_closed_1m_candle", lambda *_a: ("m-hist", 999.0)
+        )
+        assert engine.latest_closed_candle("SYM") == ("m-ws", 101.0)
+
+        # WS has nothing yet → history fallback
+        monkeypatch.setattr(engine, "_get_last_closed_candle", lambda *_a: None)
+        assert engine.latest_closed_candle("SYM") == ("m-hist", 999.0)
+
+        # HISTORY mode prefers the official close
+        monkeypatch.setattr(engine, "CANDLE_SOURCE", "HISTORY")
+        monkeypatch.setattr(engine, "_get_last_closed_candle", lambda *_a: ("m-ws", 101.0))
+        assert engine.latest_closed_candle("SYM") == ("m-hist", 999.0)
 
     def test_vix_gate_fails_open(self, engine, monkeypatch):
         # No VIX data available → do not block (backtest parity)
