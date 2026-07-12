@@ -48,6 +48,7 @@ import {
 import { Skeleton } from '@/components/ui/skeleton'
 import { Switch } from '@/components/ui/switch'
 import {
+  ENTRY_WEEKDAY_OPTIONS,
   LEG_STATE_STYLES,
   PHASE_LABELS,
   SCHEDULE_DAY_OPTIONS,
@@ -55,25 +56,42 @@ import {
   type StbtHistoryRecord,
   type StbtLeg,
   type StbtStatusResponse,
+  type StbtStrategyType,
+  STRATEGY_TYPE_LABELS,
   SUPPORTED_UNDERLYINGS,
 } from '@/types/stbt'
 import { showToast } from '@/utils/toast'
 
 interface FormState {
   name: string
+  strategy_type: StbtStrategyType
   underlying: string
+  // STBT short-strangle fields
   entry_drop_pct: string
   sl_pct: string
   max_reentries: string
   hedge_target_premium: string
-  lot_multiplier: string
-  max_loss: string
   take_profit_pct: string
-  telegram_alerts: boolean
   reentry_method: 'CANDLE_CLOSE' | 'LTP'
   allow_day2_reentry: boolean
   entry_time: string
   hedge_time: string
+  // BTST flip fields
+  moneyness: string
+  drop_pct: string
+  vsl_pct: string
+  real_sl_pct: string
+  vix_max: string
+  dte_min: string
+  dte_max: string
+  entry_weekdays: string[]
+  ref_time: string
+  entry_start_time: string
+  entry_end_time: string
+  // shared
+  lot_multiplier: string
+  max_loss: string
+  telegram_alerts: boolean
   ws_close_time: string
   day2_open_time: string
   force_exit_time: string
@@ -84,19 +102,31 @@ interface FormState {
 
 const DEFAULT_FORM: FormState = {
   name: '',
+  strategy_type: 'stbt',
   underlying: 'SENSEX',
   entry_drop_pct: '5',
   sl_pct: '20',
   max_reentries: '1',
   hedge_target_premium: '20',
-  lot_multiplier: '1',
-  max_loss: '0',
   take_profit_pct: '0',
-  telegram_alerts: true,
   reentry_method: 'CANDLE_CLOSE',
   allow_day2_reentry: true,
   entry_time: '11:00',
   hedge_time: '15:26',
+  moneyness: '2',
+  drop_pct: '5',
+  vsl_pct: '20',
+  real_sl_pct: '30',
+  vix_max: '18',
+  dte_min: '1',
+  dte_max: '3',
+  entry_weekdays: ['mon', 'tue', 'wed', 'thu'],
+  ref_time: '11:00',
+  entry_start_time: '11:01',
+  entry_end_time: '14:59',
+  lot_multiplier: '1',
+  max_loss: '0',
+  telegram_alerts: true,
   ws_close_time: '15:29',
   day2_open_time: '09:16',
   force_exit_time: '10:30',
@@ -109,19 +139,31 @@ function formFromConfig(config: StbtConfig): FormState {
   const p = config.params || {}
   return {
     name: config.name,
+    strategy_type: config.strategy_type === 'btst' ? 'btst' : 'stbt',
     underlying: config.underlying,
     entry_drop_pct: String(p.entry_drop_pct ?? 5),
     sl_pct: String(p.sl_pct ?? 20),
     max_reentries: String(p.max_reentries ?? 1),
     hedge_target_premium: String(p.hedge_target_premium ?? 20),
-    lot_multiplier: String(p.lot_multiplier ?? 1),
-    max_loss: String(p.max_loss ?? 0),
     take_profit_pct: String(p.take_profit_pct ?? 0),
-    telegram_alerts: p.telegram_alerts ?? true,
     reentry_method: p.reentry_method === 'LTP' ? 'LTP' : 'CANDLE_CLOSE',
     allow_day2_reentry: p.allow_day2_reentry ?? true,
     entry_time: p.entry_time ?? '11:00',
     hedge_time: p.hedge_time ?? '15:26',
+    moneyness: String(p.moneyness ?? 2),
+    drop_pct: String(p.drop_pct ?? 5),
+    vsl_pct: String(p.vsl_pct ?? 20),
+    real_sl_pct: String(p.real_sl_pct ?? 30),
+    vix_max: String(p.vix_max ?? 18),
+    dte_min: String(p.dte_min ?? 1),
+    dte_max: String(p.dte_max ?? 3),
+    entry_weekdays: p.entry_weekdays?.length ? p.entry_weekdays : ['mon', 'tue', 'wed', 'thu'],
+    ref_time: p.ref_time ?? '11:00',
+    entry_start_time: p.entry_start_time ?? '11:01',
+    entry_end_time: p.entry_end_time ?? '14:59',
+    lot_multiplier: String(p.lot_multiplier ?? 1),
+    max_loss: String(p.max_loss ?? 0),
+    telegram_alerts: p.telegram_alerts ?? true,
     ws_close_time: p.ws_close_time ?? '15:29',
     day2_open_time: p.day2_open_time ?? '09:16',
     force_exit_time: p.force_exit_time ?? '10:30',
@@ -134,27 +176,48 @@ function formFromConfig(config: StbtConfig): FormState {
 }
 
 function payloadFromForm(form: FormState): StbtConfigPayload {
-  return {
-    name: form.name || `${form.underlying} STBT`,
+  const shared = {
     underlying: form.underlying,
-    entry_drop_pct: Number(form.entry_drop_pct),
-    sl_pct: Number(form.sl_pct),
-    max_reentries: Number(form.max_reentries),
-    hedge_target_premium: Number(form.hedge_target_premium),
+    strategy_type: form.strategy_type,
     lot_multiplier: Number(form.lot_multiplier),
     max_loss: Number(form.max_loss),
-    take_profit_pct: Number(form.take_profit_pct),
     telegram_alerts: form.telegram_alerts,
-    reentry_method: form.reentry_method,
-    allow_day2_reentry: form.allow_day2_reentry,
-    entry_time: form.entry_time,
-    hedge_time: form.hedge_time,
     ws_close_time: form.ws_close_time,
     day2_open_time: form.day2_open_time,
     force_exit_time: form.force_exit_time,
     schedule_start: form.schedule_start,
     schedule_stop: form.schedule_stop,
     schedule_days: form.schedule_days,
+  }
+  if (form.strategy_type === 'btst') {
+    return {
+      ...shared,
+      name: form.name || `${form.underlying} BTST Flip`,
+      moneyness: Number(form.moneyness),
+      drop_pct: Number(form.drop_pct),
+      vsl_pct: Number(form.vsl_pct),
+      real_sl_pct: Number(form.real_sl_pct),
+      vix_max: Number(form.vix_max),
+      dte_min: Number(form.dte_min),
+      dte_max: Number(form.dte_max),
+      entry_weekdays: form.entry_weekdays,
+      ref_time: form.ref_time,
+      entry_start_time: form.entry_start_time,
+      entry_end_time: form.entry_end_time,
+    }
+  }
+  return {
+    ...shared,
+    name: form.name || `${form.underlying} STBT`,
+    entry_drop_pct: Number(form.entry_drop_pct),
+    sl_pct: Number(form.sl_pct),
+    max_reentries: Number(form.max_reentries),
+    hedge_target_premium: Number(form.hedge_target_premium),
+    take_profit_pct: Number(form.take_profit_pct),
+    reentry_method: form.reentry_method,
+    allow_day2_reentry: form.allow_day2_reentry,
+    entry_time: form.entry_time,
+    hedge_time: form.hedge_time,
   }
 }
 
@@ -165,7 +228,8 @@ function pnlClass(value: number): string {
 }
 
 function LegRow({ leg }: { leg: StbtLeg }) {
-  const mtm = leg.state === 'IN_SHORT' ? (leg.mtm_pnl ?? 0) : 0
+  const isOpen = leg.state === 'IN_SHORT' || leg.state === 'IN_LONG'
+  const mtm = isOpen ? (leg.mtm_pnl ?? 0) : 0
   const net = leg.realized_pnl - leg.charges_total + mtm
   return (
     <div className="flex items-center justify-between gap-2 rounded-md border p-2 text-sm">
@@ -177,13 +241,17 @@ function LegRow({ leg }: { leg: StbtLeg }) {
               ref ₹{leg.ref_premium.toFixed(2)}
               {(leg.ltp ?? 0) > 0 && <> · LTP ₹{(leg.ltp ?? 0).toFixed(2)}</>}
             </>
+          ) : leg.state === 'PAPER_SHORT' ? (
+            <>
+              paper short ₹{(leg.v_entry ?? 0).toFixed(2)} · buys at ₹
+              {(leg.v_sl ?? 0).toFixed(2)}
+              {(leg.ltp ?? 0) > 0 && <> · LTP ₹{(leg.ltp ?? 0).toFixed(2)}</>}
+            </>
           ) : (
             <>
               entry ₹{leg.entry_price.toFixed(2)} · SL ₹{leg.sl_price.toFixed(2)}
-              {leg.state === 'IN_SHORT' && (leg.ltp ?? 0) > 0 && (
-                <> · LTP ₹{(leg.ltp ?? 0).toFixed(2)}</>
-              )}{' '}
-              · re-entries {leg.reentries}
+              {isOpen && (leg.ltp ?? 0) > 0 && <> · LTP ₹{(leg.ltp ?? 0).toFixed(2)}</>}
+              {leg.reentries !== undefined && <> · re-entries {leg.reentries}</>}
             </>
           )}
         </div>
@@ -194,7 +262,7 @@ function LegRow({ leg }: { leg: StbtLeg }) {
             {net >= 0 ? '+' : ''}
             {net.toFixed(2)}
           </div>
-          {leg.state === 'IN_SHORT' && (
+          {isOpen && (
             <div className="text-[10px] text-muted-foreground">
               MTM {mtm >= 0 ? '+' : ''}
               {mtm.toFixed(2)}
@@ -584,11 +652,11 @@ export default function Stbt() {
             <Moon className="h-6 w-6" /> STBT
           </h1>
           <p className="text-sm text-muted-foreground">
-            Sell Today Buy Tomorrow — short ITM-2 CE/PE overnight with an OTM hedge
+            Overnight strategies — STBT short strangle and the BTST paper-short flip
           </p>
         </div>
         <Button onClick={openCreate}>
-          <Plus className="mr-1 h-4 w-4" /> New STBT Config
+          <Plus className="mr-1 h-4 w-4" /> New Config
         </Button>
       </div>
 
@@ -634,6 +702,16 @@ export default function Stbt() {
                       <CardTitle className="flex flex-wrap items-center gap-2 text-lg">
                         <span className="truncate">{config.name}</span>
                         <Badge variant="outline">{config.underlying}</Badge>
+                        <Badge
+                          variant="outline"
+                          className={
+                            config.strategy_type === 'btst'
+                              ? 'bg-purple-500/10 text-purple-600 dark:text-purple-400'
+                              : 'bg-amber-500/10 text-amber-600 dark:text-amber-400'
+                          }
+                        >
+                          {STRATEGY_TYPE_LABELS[config.strategy_type ?? 'stbt']}
+                        </Badge>
                         {config.is_running ? (
                           <Badge className="bg-green-500/15 text-green-600 dark:text-green-400">
                             Running
@@ -686,7 +764,9 @@ export default function Stbt() {
                         const live = status?.live
                         const hasPosition =
                           !!live &&
-                          ((live.main_legs || []).some((l) => l.state === 'IN_SHORT') ||
+                          ((live.main_legs || []).some(
+                            (l) => l.state === 'IN_SHORT' || l.state === 'IN_LONG'
+                          ) ||
                             live.hedge?.state === 'OPEN')
                         if (!config.is_running && !hasPosition) return null
                         return (
@@ -736,18 +816,36 @@ export default function Stbt() {
                     </Alert>
                   )}
                   <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
-                    <span>entry drop {config.params?.entry_drop_pct ?? 5}%</span>
-                    <span>SL {config.params?.sl_pct ?? 20}%</span>
-                    <span>re-entries {config.params?.max_reentries ?? 1}</span>
-                    <span>hedge ≈₹{config.params?.hedge_target_premium ?? 20}</span>
-                    <span>lots ×{config.params?.lot_multiplier ?? 1}</span>
+                    {config.strategy_type === 'btst' ? (
+                      <>
+                        <span>ITM-{config.params?.moneyness ?? 2} CE</span>
+                        <span>drop {config.params?.drop_pct ?? 5}%</span>
+                        <span>flip +{config.params?.vsl_pct ?? 20}%</span>
+                        <span>SL {config.params?.real_sl_pct ?? 30}%</span>
+                        {(config.params?.vix_max ?? 0) > 0 && (
+                          <span>VIX ≤ {config.params?.vix_max ?? 18}</span>
+                        )}
+                        <span>
+                          DTE {config.params?.dte_min ?? 1}–{config.params?.dte_max ?? 3}
+                        </span>
+                        <span>lots ×{config.params?.lot_multiplier ?? 1}</span>
+                      </>
+                    ) : (
+                      <>
+                        <span>entry drop {config.params?.entry_drop_pct ?? 5}%</span>
+                        <span>SL {config.params?.sl_pct ?? 20}%</span>
+                        <span>re-entries {config.params?.max_reentries ?? 1}</span>
+                        <span>hedge ≈₹{config.params?.hedge_target_premium ?? 20}</span>
+                        <span>lots ×{config.params?.lot_multiplier ?? 1}</span>
+                        {(config.params?.take_profit_pct ?? 0) > 0 && (
+                          <span className="text-green-600/80">
+                            target {config.params?.take_profit_pct}%
+                          </span>
+                        )}
+                      </>
+                    )}
                     {(config.params?.max_loss ?? 0) > 0 && (
                       <span className="text-red-500/80">max loss ₹{config.params?.max_loss}</span>
-                    )}
-                    {(config.params?.take_profit_pct ?? 0) > 0 && (
-                      <span className="text-green-600/80">
-                        target {config.params?.take_profit_pct}%
-                      </span>
                     )}
                   </div>
                   {status && <LivePanel status={status} />}
@@ -765,20 +863,46 @@ export default function Stbt() {
       <Dialog open={formOpen} onOpenChange={setFormOpen}>
         <DialogContent className="max-h-[90vh] max-w-2xl overflow-y-auto">
           <DialogHeader>
-            <DialogTitle>{editing ? `Edit ${editing.name}` : 'New STBT Config'}</DialogTitle>
+            <DialogTitle>
+              {editing
+                ? `Edit ${editing.name}`
+                : form.strategy_type === 'btst'
+                  ? 'New BTST Flip Config'
+                  : 'New STBT Config'}
+            </DialogTitle>
             <DialogDescription>
               {editing
-                ? 'Underlying cannot be changed after creation.'
-                : 'Parameters default to the classic SENSEX STBT setup.'}
+                ? 'Strategy type and underlying cannot be changed after creation.'
+                : form.strategy_type === 'btst'
+                  ? 'Paper-short flip: 5% drop opens a virtual short; its +20% stop-out buys the CE. Defaults match the filtered SENSEX backtest.'
+                  : 'Parameters default to the classic SENSEX STBT setup.'}
             </DialogDescription>
           </DialogHeader>
 
           <div className="grid gap-4 sm:grid-cols-2">
             <div className="space-y-1.5">
+              <Label>Strategy type</Label>
+              <Select
+                value={form.strategy_type}
+                disabled={!!editing}
+                onValueChange={(value) =>
+                  setForm((prev) => ({ ...prev, strategy_type: value as StbtStrategyType }))
+                }
+              >
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="stbt">STBT — short strangle overnight</SelectItem>
+                  <SelectItem value="btst">BTST — paper-short flip (long CE)</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="space-y-1.5">
               <Label htmlFor="stbt-name">Name</Label>
               <Input
                 id="stbt-name"
-                placeholder={`${form.underlying} STBT`}
+                placeholder={`${form.underlying} ${form.strategy_type === 'btst' ? 'BTST Flip' : 'STBT'}`}
                 value={form.name}
                 onChange={(e) => setForm((prev) => ({ ...prev, name: e.target.value }))}
               />
@@ -802,65 +926,128 @@ export default function Stbt() {
                 </SelectContent>
               </Select>
             </div>
-
-            {numberField('Entry drop %', 'entry_drop_pct', { step: '0.5', min: '0', max: '50' })}
-            {numberField('Stop-loss %', 'sl_pct', { step: '1', min: '1', max: '200' })}
-            {numberField('Max re-entries', 'max_reentries', { step: '1', min: '0', max: '5' })}
-            {numberField('Hedge target ₹', 'hedge_target_premium', {
-              step: '5',
-              min: '1',
-              max: '1000',
-            })}
             {numberField('Lot multiplier', 'lot_multiplier', { step: '1', min: '1', max: '100' })}
-            {numberField('Max loss ₹ (0 = off)', 'max_loss', { step: '500', min: '0' })}
-            {numberField('Take profit % (0 = off)', 'take_profit_pct', {
-              step: '5',
-              min: '0',
-              max: '99',
-            })}
 
-            <div className="space-y-1.5">
-              <Label>Re-entry method</Label>
-              <Select
-                value={form.reentry_method}
-                onValueChange={(value) =>
-                  setForm((prev) => ({
-                    ...prev,
-                    reentry_method: value as FormState['reentry_method'],
-                  }))
-                }
-              >
-                <SelectTrigger>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="CANDLE_CLOSE">1-min candle close (StockMock)</SelectItem>
-                  <SelectItem value="LTP">Instant tick (LTP)</SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
+            {form.strategy_type === 'btst' ? (
+              <>
+                {numberField('ITM level (CE strike)', 'moneyness', {
+                  step: '1',
+                  min: '1',
+                  max: '5',
+                })}
+                {numberField('Drop % (paper short)', 'drop_pct', {
+                  step: '0.5',
+                  min: '0',
+                  max: '50',
+                })}
+                {numberField('Flip trigger % (virtual SL)', 'vsl_pct', {
+                  step: '1',
+                  min: '1',
+                  max: '200',
+                })}
+                {numberField('Stop-loss % (below buy)', 'real_sl_pct', {
+                  step: '1',
+                  min: '1',
+                  max: '99',
+                })}
+                {numberField('Max India VIX (0 = off)', 'vix_max', {
+                  step: '0.5',
+                  min: '0',
+                  max: '100',
+                })}
+                {numberField('Min DTE', 'dte_min', { step: '1', min: '1', max: '30' })}
+                {numberField('Max DTE', 'dte_max', { step: '1', min: '1', max: '30' })}
+                {numberField('Max loss ₹ (0 = off)', 'max_loss', { step: '500', min: '0' })}
 
-            <div className="flex items-center justify-between rounded-md border p-3 sm:col-span-2">
-              <div>
-                <Label>Allow Day-2 re-entry</Label>
-                <p className="text-xs text-muted-foreground">
-                  Continue SL re-entry checks on Day-2 (StockMock positional style)
-                </p>
-              </div>
-              <Switch
-                checked={form.allow_day2_reentry}
-                onCheckedChange={(checked) =>
-                  setForm((prev) => ({ ...prev, allow_day2_reentry: checked }))
-                }
-              />
-            </div>
+                <div className="space-y-1.5 sm:col-span-2">
+                  <Label>Entry days (Friday off = weekend theta filter)</Label>
+                  <div className="flex flex-wrap gap-1.5">
+                    {ENTRY_WEEKDAY_OPTIONS.map((day) => (
+                      <Button
+                        key={day.value}
+                        type="button"
+                        size="sm"
+                        variant={form.entry_weekdays.includes(day.value) ? 'default' : 'outline'}
+                        onClick={() =>
+                          setForm((prev) => ({
+                            ...prev,
+                            entry_weekdays: prev.entry_weekdays.includes(day.value)
+                              ? prev.entry_weekdays.filter((d) => d !== day.value)
+                              : [...prev.entry_weekdays, day.value],
+                          }))
+                        }
+                      >
+                        {day.label}
+                      </Button>
+                    ))}
+                  </div>
+                </div>
+              </>
+            ) : (
+              <>
+                {numberField('Entry drop %', 'entry_drop_pct', {
+                  step: '0.5',
+                  min: '0',
+                  max: '50',
+                })}
+                {numberField('Stop-loss %', 'sl_pct', { step: '1', min: '1', max: '200' })}
+                {numberField('Max re-entries', 'max_reentries', { step: '1', min: '0', max: '5' })}
+                {numberField('Hedge target ₹', 'hedge_target_premium', {
+                  step: '5',
+                  min: '1',
+                  max: '1000',
+                })}
+                {numberField('Max loss ₹ (0 = off)', 'max_loss', { step: '500', min: '0' })}
+                {numberField('Take profit % (0 = off)', 'take_profit_pct', {
+                  step: '5',
+                  min: '0',
+                  max: '99',
+                })}
+
+                <div className="space-y-1.5">
+                  <Label>Re-entry method</Label>
+                  <Select
+                    value={form.reentry_method}
+                    onValueChange={(value) =>
+                      setForm((prev) => ({
+                        ...prev,
+                        reentry_method: value as FormState['reentry_method'],
+                      }))
+                    }
+                  >
+                    <SelectTrigger>
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="CANDLE_CLOSE">1-min candle close (StockMock)</SelectItem>
+                      <SelectItem value="LTP">Instant tick (LTP)</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+
+                <div className="flex items-center justify-between rounded-md border p-3 sm:col-span-2">
+                  <div>
+                    <Label>Allow Day-2 re-entry</Label>
+                    <p className="text-xs text-muted-foreground">
+                      Continue SL re-entry checks on Day-2 (StockMock positional style)
+                    </p>
+                  </div>
+                  <Switch
+                    checked={form.allow_day2_reentry}
+                    onCheckedChange={(checked) =>
+                      setForm((prev) => ({ ...prev, allow_day2_reentry: checked }))
+                    }
+                  />
+                </div>
+              </>
+            )}
 
             <div className="flex items-center justify-between rounded-md border p-3 sm:col-span-2">
               <div>
                 <Label>Telegram alerts</Label>
                 <p className="text-xs text-muted-foreground">
-                  Entries, SL hits, hedge, kill switch, and session summary to your linked
-                  Telegram (needs the Telegram bot set up)
+                  Entries, SL hits, kill switch, and session summary to your linked Telegram
+                  (needs the Telegram bot set up)
                 </p>
               </div>
               <Switch
@@ -871,8 +1058,18 @@ export default function Stbt() {
               />
             </div>
 
-            {timeField('Day-1 entry', 'entry_time')}
-            {timeField('Hedge placement', 'hedge_time')}
+            {form.strategy_type === 'btst' ? (
+              <>
+                {timeField('Reference snapshot', 'ref_time')}
+                {timeField('Entry window start', 'entry_start_time')}
+                {timeField('Entry window end', 'entry_end_time')}
+              </>
+            ) : (
+              <>
+                {timeField('Day-1 entry', 'entry_time')}
+                {timeField('Hedge placement', 'hedge_time')}
+              </>
+            )}
             {timeField('WS close', 'ws_close_time')}
             {timeField('Day-2 open', 'day2_open_time')}
             {timeField('Day-2 force exit', 'force_exit_time')}
@@ -913,7 +1110,14 @@ export default function Stbt() {
             <Button variant="outline" onClick={() => setFormOpen(false)}>
               Cancel
             </Button>
-            <Button onClick={handleSave} disabled={saving || form.schedule_days.length === 0}>
+            <Button
+              onClick={handleSave}
+              disabled={
+                saving ||
+                form.schedule_days.length === 0 ||
+                (form.strategy_type === 'btst' && form.entry_weekdays.length === 0)
+              }
+            >
               {saving && <RefreshCw className="mr-1 h-4 w-4 animate-spin" />}
               {editing ? 'Save changes' : 'Create config'}
             </Button>

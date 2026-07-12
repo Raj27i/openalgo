@@ -1,20 +1,38 @@
 // Types for the STBT (Sell Today Buy Tomorrow) tab — mirrors blueprints/stbt.py
-// and the status JSON written by strategies/stbt/engine.py.
+// and the status JSON written by strategies/stbt/engine.py (strategy_type
+// 'stbt') and strategies/stbt/btst_engine.py (strategy_type 'btst').
+
+export type StbtStrategyType = 'stbt' | 'btst'
 
 export interface StbtParams {
   underlying: string
+  strategy_type?: StbtStrategyType
+  // STBT (short strangle) params
   entry_drop_pct?: number
   sl_pct?: number
   max_reentries?: number
   reentry_method?: 'CANDLE_CLOSE' | 'LTP'
   allow_day2_reentry?: boolean
   hedge_target_premium?: number
-  lot_multiplier?: number
-  max_loss?: number
   take_profit_pct?: number
-  telegram_alerts?: boolean
   entry_time?: string
   hedge_time?: string
+  // BTST (paper-short flip long) params
+  moneyness?: number
+  drop_pct?: number
+  vsl_pct?: number
+  real_sl_pct?: number
+  vix_max?: number
+  dte_min?: number
+  dte_max?: number
+  entry_weekdays?: string[]
+  ref_time?: string
+  entry_start_time?: string
+  entry_end_time?: string
+  // shared
+  lot_multiplier?: number
+  max_loss?: number
+  telegram_alerts?: boolean
   ws_close_time?: string
   day2_open_time?: string
   force_exit_time?: string
@@ -23,6 +41,7 @@ export interface StbtParams {
 export interface StbtConfig {
   strategy_id: string
   name: string
+  strategy_type?: StbtStrategyType
   underlying: string
   params: StbtParams
   is_running: boolean
@@ -38,7 +57,13 @@ export interface StbtConfig {
   last_stopped?: string
 }
 
-export type StbtLegState = 'WATCHING' | 'IN_SHORT' | 'SL_HIT' | 'DONE'
+export type StbtLegState =
+  | 'WATCHING'
+  | 'IN_SHORT'
+  | 'SL_HIT'
+  | 'PAPER_SHORT'
+  | 'IN_LONG'
+  | 'DONE'
 
 export interface StbtLeg {
   symbol: string
@@ -48,7 +73,10 @@ export interface StbtLeg {
   ref_premium: number
   entry_price: number
   sl_price: number
-  reentries: number
+  reentries?: number
+  // BTST flip legs: the virtual paper-short levels
+  v_entry?: number
+  v_sl?: number
   realized_pnl: number
   charges_total: number
   ltp?: number
@@ -155,6 +183,7 @@ export interface StbtAnalyticsConfig {
   strategy_id: string
   name: string
   underlying: string
+  strategy_type?: StbtStrategyType
 }
 
 export interface StbtAnalyticsResponse {
@@ -198,6 +227,7 @@ export const PHASE_LABELS: Record<string, string> = {
   DAY1_DONE: 'Day 1 complete — carry overnight',
   DAY2: 'Day 2 — exit session',
   EXPIRY_DAY: 'Expiry day — no new positions',
+  NO_ENTRY: 'Filters block entries today',
   DONE: 'Session finished',
   KILLED: 'KILLED — max loss hit',
   TARGET_HIT: 'Target hit — booked out flat',
@@ -208,5 +238,20 @@ export const LEG_STATE_STYLES: Record<StbtLegState, string> = {
   WATCHING: 'bg-blue-500/15 text-blue-600 dark:text-blue-400',
   IN_SHORT: 'bg-amber-500/15 text-amber-600 dark:text-amber-400',
   SL_HIT: 'bg-red-500/15 text-red-600 dark:text-red-400',
+  PAPER_SHORT: 'bg-purple-500/15 text-purple-600 dark:text-purple-400',
+  IN_LONG: 'bg-green-500/15 text-green-600 dark:text-green-400',
   DONE: 'bg-muted text-muted-foreground',
 }
+
+export const STRATEGY_TYPE_LABELS: Record<StbtStrategyType, string> = {
+  stbt: 'STBT short',
+  btst: 'BTST flip',
+}
+
+export const ENTRY_WEEKDAY_OPTIONS = [
+  { value: 'mon', label: 'Mon' },
+  { value: 'tue', label: 'Tue' },
+  { value: 'wed', label: 'Wed' },
+  { value: 'thu', label: 'Thu' },
+  { value: 'fri', label: 'Fri' },
+] as const

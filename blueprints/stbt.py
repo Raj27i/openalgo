@@ -64,35 +64,66 @@ _OPT_EXCHANGE = {
 _TIME_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
 _VALID_DAYS = {"mon", "tue", "wed", "thu", "fri", "sat", "sun"}
 
-# Editable engine parameters: name -> (type, min, max). Times validated separately.
+# Config kinds hosted by this tab. "stbt" = short strangle engine.py,
+# "btst" = long paper-short-flip btst_engine.py.
+_STRATEGY_TYPES = {"stbt", "btst"}
+
+# Editable engine parameters per type: name -> (type, min, max).
+# Times validated separately.
 _NUMERIC_PARAMS = {
-    "entry_drop_pct": (float, 0.0, 50.0),
-    "sl_pct": (float, 1.0, 200.0),
-    "max_reentries": (int, 0, 5),
-    "hedge_target_premium": (float, 1.0, 1000.0),
-    "lot_multiplier": (int, 1, 100),
-    "max_loss": (float, 0.0, 10_000_000.0),  # session kill switch ₹; 0 = disabled
-    "take_profit_pct": (float, 0.0, 99.0),  # combined profit target %; 0 = disabled
+    "stbt": {
+        "entry_drop_pct": (float, 0.0, 50.0),
+        "sl_pct": (float, 1.0, 200.0),
+        "max_reentries": (int, 0, 5),
+        "hedge_target_premium": (float, 1.0, 1000.0),
+        "lot_multiplier": (int, 1, 100),
+        "max_loss": (float, 0.0, 10_000_000.0),  # session kill switch ₹; 0 = disabled
+        "take_profit_pct": (float, 0.0, 99.0),  # combined profit target %; 0 = disabled
+    },
+    "btst": {
+        "moneyness": (int, 1, 5),  # ITM-N CE strike selection
+        "drop_pct": (float, 0.0, 50.0),  # paper-short trigger
+        "vsl_pct": (float, 1.0, 200.0),  # virtual SL distance → real-buy trigger
+        "real_sl_pct": (float, 1.0, 99.0),  # SL below the bought premium
+        "vix_max": (float, 0.0, 100.0),  # India VIX entry ceiling; 0 = disabled
+        "dte_min": (int, 1, 30),
+        "dte_max": (int, 1, 30),
+        "lot_multiplier": (int, 1, 100),
+        "max_loss": (float, 0.0, 10_000_000.0),
+    },
 }
-_TIME_PARAMS = ("entry_time", "hedge_time", "ws_close_time", "day2_open_time", "force_exit_time")
+_TIME_PARAMS = {
+    "stbt": ("entry_time", "hedge_time", "ws_close_time", "day2_open_time", "force_exit_time"),
+    "btst": (
+        "ref_time",
+        "entry_start_time",
+        "entry_end_time",
+        "ws_close_time",
+        "day2_open_time",
+        "force_exit_time",
+    ),
+}
 _REENTRY_METHODS = {"CANDLE_CLOSE", "LTP"}
 
 LAUNCHER_TEMPLATE = '''#!/usr/bin/env python
 """Auto-generated STBT launcher — managed by the /stbt tab.
 
 Do not edit: parameters live in strategies/stbt/{strategy_id}_config.json
-and the trading logic in strategies/stbt/engine.py.
+and the trading logic in strategies/stbt/{engine_module}.py.
 """
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # strategies/
 
-from stbt.engine import main
+from stbt.{engine_module} import main
 
 if __name__ == "__main__":
     main()
 '''
+
+# strategy_type -> engine module under strategies/stbt/
+_ENGINE_MODULES = {"stbt": "engine", "btst": "btst_engine"}
 
 
 def _config_path(strategy_id: str) -> Path:
@@ -164,7 +195,9 @@ def _verify_stbt(strategy_id: str, user_id: str):
     return entry, None
 
 
-def _validate_params(data: dict, partial: bool = False) -> tuple[dict, str | None]:
+def _validate_params(
+    data: dict, partial: bool = False, strategy_type: str = "stbt"
+) -> tuple[dict, str | None]:
     """Validate and normalize engine parameters from the request body.
 
     With partial=True only validates keys that are present (for updates).
@@ -178,7 +211,7 @@ def _validate_params(data: dict, partial: bool = False) -> tuple[dict, str | Non
             return {}, f"Unsupported underlying: {underlying}"
         clean["underlying"] = underlying
 
-    for key, (cast, lo, hi) in _NUMERIC_PARAMS.items():
+    for key, (cast, lo, hi) in _NUMERIC_PARAMS[strategy_type].items():
         if key not in data:
             if partial:
                 continue
@@ -193,7 +226,13 @@ def _validate_params(data: dict, partial: bool = False) -> tuple[dict, str | Non
             return {}, f"{key} must be between {lo} and {hi}"
         clean[key] = value
 
-    for key in _TIME_PARAMS:
+    if strategy_type == "btst":
+        dte_min = clean.get("dte_min")
+        dte_max = clean.get("dte_max")
+        if dte_min is not None and dte_max is not None and dte_min > dte_max:
+            return {}, "dte_min cannot be greater than dte_max"
+
+    for key in _TIME_PARAMS[strategy_type]:
         if key not in data or data.get(key) in (None, ""):
             continue
         value = str(data[key]).strip()
@@ -201,14 +240,25 @@ def _validate_params(data: dict, partial: bool = False) -> tuple[dict, str | Non
             return {}, f"{key} must be HH:MM (24-hour)"
         clean[key] = value
 
-    if data.get("reentry_method"):
-        method = str(data["reentry_method"]).upper().strip()
-        if method not in _REENTRY_METHODS:
-            return {}, f"reentry_method must be one of {sorted(_REENTRY_METHODS)}"
-        clean["reentry_method"] = method
+    if strategy_type == "stbt":
+        if data.get("reentry_method"):
+            method = str(data["reentry_method"]).upper().strip()
+            if method not in _REENTRY_METHODS:
+                return {}, f"reentry_method must be one of {sorted(_REENTRY_METHODS)}"
+            clean["reentry_method"] = method
 
-    if "allow_day2_reentry" in data and data["allow_day2_reentry"] is not None:
-        clean["allow_day2_reentry"] = bool(data["allow_day2_reentry"])
+        if "allow_day2_reentry" in data and data["allow_day2_reentry"] is not None:
+            clean["allow_day2_reentry"] = bool(data["allow_day2_reentry"])
+
+    if strategy_type == "btst" and data.get("entry_weekdays") is not None:
+        days = data["entry_weekdays"]
+        if (
+            not isinstance(days, list)
+            or not days
+            or any(str(d).lower() not in _VALID_DAYS for d in days)
+        ):
+            return {}, "entry_weekdays must be a non-empty list of mon..sun"
+        clean["entry_weekdays"] = [str(d).lower() for d in days]
 
     if "telegram_alerts" in data and data["telegram_alerts"] is not None:
         clean["telegram_alerts"] = bool(data["telegram_alerts"])
@@ -239,6 +289,7 @@ def _serialize(strategy_id: str, entry: dict) -> dict:
     return {
         "strategy_id": strategy_id,
         "name": entry.get("name", strategy_id),
+        "strategy_type": params.get("strategy_type", "stbt"),
         "underlying": params.get("underlying", "SENSEX"),
         "params": params,
         "is_running": entry.get("is_running", False),
@@ -279,7 +330,12 @@ def create_config():
         return jsonify({"status": "error", "message": "Session expired"}), 401
 
     data = request.get_json(silent=True) or {}
-    params, err = _validate_params(data)
+    strategy_type = str(data.get("strategy_type") or "stbt").lower().strip()
+    if strategy_type not in _STRATEGY_TYPES:
+        return jsonify(
+            {"status": "error", "message": f"strategy_type must be one of {sorted(_STRATEGY_TYPES)}"}
+        ), 400
+    params, err = _validate_params(data, strategy_type=strategy_type)
     if err:
         return jsonify({"status": "error", "message": err}), 400
     start, stop, days, err = _validate_schedule(data)
@@ -288,19 +344,25 @@ def create_config():
 
     underlying = params["underlying"]
     ist_now = get_ist_time()
-    strategy_id = f"stbt_{underlying.lower()}_{ist_now.strftime('%Y%m%d%H%M%S')}"
-    raw_name = str(data.get("name") or f"{underlying} STBT").strip()[:100]
+    strategy_id = f"{strategy_type}_{underlying.lower()}_{ist_now.strftime('%Y%m%d%H%M%S')}"
+    default_name = f"{underlying} {'BTST Flip' if strategy_type == 'btst' else 'STBT'}"
+    raw_name = str(data.get("name") or default_name).strip()[:100]
 
     try:
         # Owner username rides in the params JSON so the engine subprocess can
-        # resolve the Telegram chat id without host-only context.
+        # resolve the Telegram chat id without host-only context. The type
+        # rides there too so the engine and the panic path can read it back.
         params["user_id"] = user_id
+        params["strategy_type"] = strategy_type
         _write_json_atomic(_config_path(strategy_id), params)
 
         launcher_path = STRATEGIES_DIR / f"{strategy_id}.py"
         STRATEGIES_DIR.mkdir(parents=True, exist_ok=True)
         launcher_path.write_text(
-            LAUNCHER_TEMPLATE.format(strategy_id=strategy_id), encoding="utf-8"
+            LAUNCHER_TEMPLATE.format(
+                strategy_id=strategy_id, engine_module=_ENGINE_MODULES[strategy_type]
+            ),
+            encoding="utf-8",
         )
         if os.name != "nt":
             try:
@@ -358,18 +420,22 @@ def update_config(strategy_id):
         ), 409
 
     data = request.get_json(silent=True) or {}
-    updates, err = _validate_params(data, partial=True)
+    params = _read_json(_config_path(strategy_id)) or {}
+    strategy_type = str(params.get("strategy_type", "stbt")).lower()
+    if strategy_type not in _STRATEGY_TYPES:
+        strategy_type = "stbt"
+    if data.get("strategy_type") and str(data["strategy_type"]).lower() != strategy_type:
+        return jsonify(
+            {"status": "error", "message": "strategy_type cannot be changed — create a new config"}
+        ), 400
+    updates, err = _validate_params(data, partial=True, strategy_type=strategy_type)
     if err:
         return jsonify({"status": "error", "message": err}), 400
-    if "underlying" in updates and updates["underlying"] != (
-        (_read_json(_config_path(strategy_id)) or {}).get("underlying")
-    ):
+    if "underlying" in updates and updates["underlying"] != params.get("underlying"):
         return jsonify(
             {"status": "error", "message": "Underlying cannot be changed — create a new config"}
         ), 400
     updates.pop("underlying", None)
-
-    params = _read_json(_config_path(strategy_id)) or {}
     params.update(updates)
     try:
         _write_json_atomic(_config_path(strategy_id), params)
@@ -634,14 +700,17 @@ def get_analytics():
         "worst_day": worst,
     }
 
-    configs = [
-        {
-            "strategy_id": sid,
-            "name": STRATEGY_CONFIGS[sid].get("name", sid),
-            "underlying": (_read_json(_config_path(sid)) or {}).get("underlying", ""),
-        }
-        for sid in sorted(_owned_stbt_ids(user_id))
-    ]
+    configs = []
+    for sid in sorted(_owned_stbt_ids(user_id)):
+        cfg_params = _read_json(_config_path(sid)) or {}
+        configs.append(
+            {
+                "strategy_id": sid,
+                "name": STRATEGY_CONFIGS[sid].get("name", sid),
+                "underlying": cfg_params.get("underlying", ""),
+                "strategy_type": cfg_params.get("strategy_type", "stbt"),
+            }
+        )
 
     return jsonify(
         {
@@ -707,7 +776,8 @@ def panic_close(strategy_id):
     underlying = str(params.get("underlying", "SENSEX")).upper()
     opt_exchange = _OPT_EXCHANGE.get(underlying, "BFO")
     product = str(params.get("product", "NRML")).upper()
-    strategy_tag = f"{underlying}_STBT"
+    strategy_kind = str(params.get("strategy_type", "stbt")).upper()
+    strategy_tag = f"{underlying}_{strategy_kind}"
     symbols = _open_symbols(strategy_id)
 
     api_key = get_api_key_for_tradingview(user_id)
