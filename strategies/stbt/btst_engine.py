@@ -221,12 +221,18 @@ JOURNAL_MAX_RECORDS = 2000
 #  LOGGING
 # ─────────────────────────────────────────────────────────────────────────────
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler()],
-)
+# Private handler + propagate=False: the platform's utils/logging.setup_logging
+# runs at import time when the Telegram thread pulls in services/database
+# modules, and it WIPES the root logger's handlers (root_logger.handlers = [])
+# and installs a formatter that prints record.msg without %-args. With
+# basicConfig (root-based) that garbled every engine log line after the first
+# Telegram alert ("CE %s=%.2f [%s]..."). An isolated logger is immune.
 log = logging.getLogger("BTST")
+log.setLevel(logging.INFO)
+_log_handler = logging.StreamHandler()
+_log_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+log.addHandler(_log_handler)
+log.propagate = False
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  GRACEFUL SHUTDOWN

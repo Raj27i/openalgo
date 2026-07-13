@@ -231,12 +231,18 @@ HISTORY_MAX_RECORDS = 400
 #  LOGGING  — stdout is captured by the Strategy Manager into per-run log file
 # ─────────────────────────────────────────────────────────────────────────────
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler()],
-)
+# Private handler + propagate=False: the platform's utils/logging.setup_logging
+# runs at import time when the Telegram thread pulls in services/database
+# modules, and it WIPES the root logger's handlers and installs a formatter
+# that prints record.msg without %-args — with basicConfig (root-based) every
+# engine log line after the first Telegram alert came out garbled
+# ("[CE] ... %s=%.2f"). An isolated logger is immune to the root reset.
 log = logging.getLogger("STBT")
+log.setLevel(logging.INFO)
+_log_handler = logging.StreamHandler()
+_log_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+log.addHandler(_log_handler)
+log.propagate = False
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  GRACEFUL SHUTDOWN
