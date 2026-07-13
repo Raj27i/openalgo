@@ -166,6 +166,58 @@ class TestFlipBuy:
 
 
 # ---------------------------------------------------------------------------
+# TICK trigger mode — same levels, fires on live ticks
+# ---------------------------------------------------------------------------
+
+
+class TestTickTriggerMode:
+    def test_tick_arm_and_flip(self, engine, leg, monkeypatch):
+        # arm on the first tick at/below the 5% drop level
+        assert leg.on_signal_tick(960.0, _noop_save) is False  # above trigger
+        assert leg.on_signal_tick(950.0, _noop_save) is True
+        assert leg.state == engine.FlipLeg.PAPER_SHORT
+        assert leg.v_sl == pytest.approx(1140.0)
+        # flip fires the instant a tick touches the virtual SL (no candle wait)
+        monkeypatch.setattr(engine, "_place_order", lambda *a, **k: "OID-T")
+        monkeypatch.setattr(engine, "_get_fill_price", lambda *_a: 1140.5)
+        assert leg.on_signal_tick(1140.0, _noop_save) is True
+        assert leg.state == engine.FlipLeg.IN_LONG
+        assert leg.entry_price == 1140.5
+
+    def test_tick_arm_and_flip_never_same_tick(self, engine, leg):
+        # arming tick sets v_sl 20% above itself — cannot also be >= v_sl
+        assert leg.on_signal_tick(950.0, _noop_save) is True
+        assert leg.state == engine.FlipLeg.PAPER_SHORT
+        assert leg.state != engine.FlipLeg.IN_LONG
+
+    def test_tick_vix_block_keeps_armed(self, engine, leg, monkeypatch):
+        leg.on_signal_tick(950.0, _noop_save)
+        monkeypatch.setattr(engine, "vix_ok", lambda: False)
+        assert leg.on_signal_tick(1150.0, _noop_save) is False
+        assert leg.state == engine.FlipLeg.PAPER_SHORT
+        monkeypatch.setattr(engine, "vix_ok", lambda: True)
+        monkeypatch.setattr(engine, "_place_order", lambda *a, **k: "OID-T2")
+        monkeypatch.setattr(engine, "_get_fill_price", lambda *_a: 1151.0)
+        assert leg.on_signal_tick(1150.0, _noop_save) is True
+        assert leg.state == engine.FlipLeg.IN_LONG
+
+    def test_tick_be_arm_and_day2_exit(self, engine, leg, monkeypatch):
+        _go_long(engine, leg, monkeypatch, fill=1000.0)
+        # BE arms on a tick, not just candle closes
+        leg.on_be_price(1300.0, _noop_save)
+        assert leg.be_armed is True
+        # Day-1 tick giveback tolerated
+        assert leg.on_be_price(995.0, _noop_save) is False
+        assert leg.state == engine.FlipLeg.IN_LONG
+        # Day-2 tick giveback exits
+        leg.entry_date = "2020-01-01"
+        monkeypatch.setattr(engine, "_smart_flatten", lambda *a, **k: ("OID-B", "placed"))
+        monkeypatch.setattr(engine, "_get_fill_price", lambda *_a: 999.0)
+        assert leg.on_be_price(1000.0, _noop_save) is True
+        assert leg.state == engine.FlipLeg.DONE
+
+
+# ---------------------------------------------------------------------------
 # Long-side stop-loss and exits
 # ---------------------------------------------------------------------------
 
@@ -227,49 +279,49 @@ class TestBreakevenStop:
         _go_long(engine, leg, monkeypatch, fill=1000.0)
         assert leg.be_armed is False
         # +29% close: not armed yet
-        assert leg.on_be_candle(1290.0, _noop_save) is False
+        assert leg.on_be_price(1290.0, _noop_save) is False
         assert leg.be_armed is False
         # +30% close: armed
-        leg.on_be_candle(1300.0, _noop_save)
+        leg.on_be_price(1300.0, _noop_save)
         assert leg.be_armed is True
 
     def test_day1_pullback_tolerated(self, engine, leg, monkeypatch):
         _go_long(engine, leg, monkeypatch, fill=1000.0)
-        leg.on_be_candle(1300.0, _noop_save)  # arm (entry_date == today)
+        leg.on_be_price(1300.0, _noop_save)  # arm (entry_date == today)
         assert leg.be_armed is True
         # Same-day giveback to entry: NO exit (Day-1 pullbacks are normal)
-        assert leg.on_be_candle(990.0, _noop_save) is False
+        assert leg.on_be_price(990.0, _noop_save) is False
         assert leg.state == engine.FlipLeg.IN_LONG
 
     def test_day2_giveback_exits(self, engine, leg, monkeypatch):
         _go_long(engine, leg, monkeypatch, fill=1000.0)
-        leg.on_be_candle(1300.0, _noop_save)  # arm on Day-1
+        leg.on_be_price(1300.0, _noop_save)  # arm on Day-1
         leg.entry_date = "2020-01-01"  # simulate Day-2 (entry was yesterday)
         monkeypatch.setattr(engine, "_smart_flatten", lambda *a, **k: ("OID-BE", "placed"))
         monkeypatch.setattr(engine, "_get_fill_price", lambda *_a: 998.0)
-        assert leg.on_be_candle(1000.0, _noop_save) is True
+        assert leg.on_be_price(1000.0, _noop_save) is True
         assert leg.state == engine.FlipLeg.DONE
 
     def test_day2_no_exit_when_not_armed(self, engine, leg, monkeypatch):
         _go_long(engine, leg, monkeypatch, fill=1000.0)
         leg.entry_date = "2020-01-01"  # Day-2, never touched +30%
-        assert leg.on_be_candle(1000.0, _noop_save) is False
+        assert leg.on_be_price(1000.0, _noop_save) is False
         assert leg.state == engine.FlipLeg.IN_LONG
 
     def test_day2_above_entry_no_exit(self, engine, leg, monkeypatch):
         _go_long(engine, leg, monkeypatch, fill=1000.0)
         leg.be_armed = True
         leg.entry_date = "2020-01-01"
-        assert leg.on_be_candle(1001.0, _noop_save) is False
+        assert leg.on_be_price(1001.0, _noop_save) is False
         assert leg.state == engine.FlipLeg.IN_LONG
 
     def test_disabled_when_zero(self, engine, leg, monkeypatch):
         _go_long(engine, leg, monkeypatch, fill=1000.0)
         monkeypatch.setattr(engine, "BE_TRIGGER_PCT", 0.0)
         leg.entry_date = "2020-01-01"
-        assert leg.on_be_candle(1300.0, _noop_save) is False
+        assert leg.on_be_price(1300.0, _noop_save) is False
         assert leg.be_armed is False
-        assert leg.on_be_candle(900.0, _noop_save) is False
+        assert leg.on_be_price(900.0, _noop_save) is False
         assert leg.state == engine.FlipLeg.IN_LONG
 
     def test_fresh_buy_resets_be(self, engine, leg, monkeypatch):

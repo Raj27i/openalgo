@@ -13,8 +13,10 @@
 #  DAY-1  ref time (default 11:00, Mon–Thu only, DTE 1–3, not expiry day)
 #    1. Fetch option chain → identify the ITM-{moneyness} CE and snapshot its
 #       premium as REFERENCE.
-#    2. On every closed 1-minute candle inside the entry window
-#       (default 11:01–14:59):
+#    2. Trigger evaluation inside the entry window (default 11:01–14:59).
+#       trigger_mode='TICK' (default): every live WebSocket tick acts the
+#       instant a level is crossed. trigger_mode='CANDLE_CLOSE': 1-minute
+#       candle closes, exact Volrix backtest parity. Levels either way:
 #         • close ≤ ref × (1 − drop_pct%)      → open a PAPER short
 #           (virtual entry = close, virtual SL = close × (1 + vsl_pct%))
 #         • close ≥ virtual SL                 → the paper short is stopped
@@ -54,7 +56,7 @@ from openalgo import api
 #  CONFIGURATION  — loaded from strategies/stbt/{STRATEGY_ID}_config.json
 # ─────────────────────────────────────────────────────────────────────────────
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 IST = ZoneInfo("Asia/Kolkata")
 
@@ -97,7 +99,8 @@ _CONFIG_DEFAULTS = {
     "real_sl_pct": 30.0,  # stop-loss % below the bought premium
     "be_trigger_pct": 30.0,  # arm breakeven at entry × (1 + this%); 0 = off
     "vix_max": 18.0,  # no entries while India VIX above this (0 = off)
-    "candle_source": "WS",  # 1-min candle closes: WS ticks first | HISTORY API first
+    "trigger_mode": "TICK",  # TICK = act on every live tick | CANDLE_CLOSE = backtest parity
+    "candle_source": "WS",  # CANDLE_CLOSE mode: WS-built candles first | HISTORY API first
     "dte_min": 1,  # allowed days-to-expiry window for entries
     "dte_max": 3,
     "entry_weekdays": ["mon", "tue", "wed", "thu"],  # no Friday entries
@@ -168,6 +171,7 @@ DROP_PCT = float(_CFG["drop_pct"])
 VSL_PCT = float(_CFG["vsl_pct"])
 REAL_SL_PCT = float(_CFG["real_sl_pct"])
 BE_TRIGGER_PCT = float(_CFG["be_trigger_pct"])
+TRIGGER_MODE = str(_CFG["trigger_mode"]).upper()  # TICK | CANDLE_CLOSE
 CANDLE_SOURCE = str(_CFG["candle_source"]).upper()  # WS | HISTORY
 VIX_MAX = float(_CFG["vix_max"])
 DTE_MIN = int(_CFG["dte_min"])
@@ -1548,6 +1552,52 @@ class FlipLeg:
 
         return False
 
+    def on_signal_tick(self, ltp: float, save_cb) -> bool:
+        """TICK trigger mode: same paper-short flip logic on every live tick.
+
+        Fires the instant the price crosses the level instead of waiting for
+        the 1-minute candle to close — earlier fills on fast moves (e.g. would
+        have bought near the 616.50 trigger instead of the 696 blow-through
+        close), at the cost of acting on unconfirmed spikes. No dedupe needed:
+        the state transitions themselves are one-way."""
+        if ltp <= 0 or self.ref_premium <= 0:
+            return False
+
+        if self.state == self.WATCHING:
+            trigger = self.ref_premium * (1 - DROP_PCT / 100.0)
+            if ltp <= trigger:
+                self.v_entry = ltp
+                self.v_sl = round(ltp * (1 + VSL_PCT / 100.0), 2)
+                self.state = self.PAPER_SHORT
+                log.info(
+                    "[%s] PAPER SHORT (tick): ltp=%.2f ≤ trigger=%.2f (ref=%.2f) — "
+                    "virtual SL / real-BUY trigger at %.2f",
+                    self.opt_type,
+                    ltp,
+                    trigger,
+                    self.ref_premium,
+                    self.v_sl,
+                )
+                save_cb()
+                return True
+            return False
+
+        if self.state == self.PAPER_SHORT:
+            if ltp < self.v_sl:
+                return False
+            if not vix_ok():
+                return False  # signal stays armed; may fire on a later tick
+            log.info(
+                "[%s] FLIP (tick): ltp=%.2f ≥ virtual SL %.2f (paper entry %.2f) — buying.",
+                self.opt_type,
+                ltp,
+                self.v_sl,
+                self.v_entry,
+            )
+            return self._buy(ltp, save_cb)
+
+        return False
+
     def _buy(self, ref_ltp: float, save_cb) -> bool:
         oid = _place_order(self.symbol, "BUY", self.quantity, reason=f"{self.opt_type}_FLIP_BUY")
         if not oid:
@@ -1582,11 +1632,12 @@ class FlipLeg:
         log.info("[%s] STOP-LOSS: LTP %.2f ≤ SL %.2f — exiting.", self.opt_type, ltp, self.sl_price)
         return self._close_at_market(save_cb, "SL", f"{self.opt_type}-SL")
 
-    def on_be_candle(self, close: float, save_cb) -> bool:
-        """Breakeven stop on 1-minute candle closes (backtest fidelity).
+    def on_be_price(self, close: float, save_cb) -> bool:
+        """Breakeven stop. Input is a live tick in TICK mode or a 1-minute
+        candle close in CANDLE_CLOSE mode — the rule is identical.
 
-        Arms on ANY day once close ≥ entry × (1 + BE_TRIGGER_PCT%). Exits at
-        market only on Day 2+ when the armed stop sees close ≤ entry — Day-1
+        Arms on ANY day once price ≥ entry × (1 + BE_TRIGGER_PCT%). Exits at
+        market only on Day 2+ when the armed stop sees price ≤ entry — Day-1
         pullbacks are tolerated (a plain any-day BE stop cost ₹44.5k of profit
         in the backtest; the Day-2-only version cost ₹4.2k and cut max DD 18%).
         """
@@ -1845,11 +1896,14 @@ def run_day1():
     entry_start = _now_ist().replace(
         hour=ENTRY_START_H, minute=ENTRY_START_M, second=0, microsecond=0
     )
+    # TICK mode: ticks act until the entry_end minute completes (the 14:59
+    # candle of the backtest closes at 15:00).
+    tick_window_end = _now_ist().replace(
+        hour=ENTRY_END_H, minute=ENTRY_END_M, second=0, microsecond=0
+    ) + timedelta(minutes=1)
     # The candle labeled entry_end closes one minute later; allow one more
     # minute for the history API to publish it before declaring no-trade.
-    window_deadline = _now_ist().replace(
-        hour=ENTRY_END_H, minute=ENTRY_END_M, second=0, microsecond=0
-    ) + timedelta(minutes=2)
+    window_deadline = tick_window_end + timedelta(minutes=1)
     _last_status_log = 0.0
 
     while not _shutdown.is_set():
@@ -1878,30 +1932,44 @@ def run_day1():
         _wait_for_tick(timeout=1)
 
         # Real SL on live ticks (bar-low fidelity, conservative); breakeven
-        # ARMS on candle closes (its exit branch is Day-2-gated, inert today).
+        # arming per trigger mode (its exit branch is Day-2-gated, inert today).
         if leg.is_long:
             ltp = live_ltp(ce_sym)
             if ltp > 0:
                 leg.on_tick(ltp, _save)
             if leg.is_long:
+                if TRIGGER_MODE == "TICK":
+                    if ltp > 0:
+                        leg.on_be_price(ltp, _save)
+                else:
+                    closed = latest_closed_candle(ce_sym)
+                    if closed:
+                        leg.on_be_price(closed[1], _save)
+        # Flip signal inside the entry window — every live tick in TICK mode,
+        # closed 1-minute candles in CANDLE_CLOSE mode.
+        elif leg.state in (FlipLeg.WATCHING, FlipLeg.PAPER_SHORT):
+            if TRIGGER_MODE == "TICK":
+                now = _now_ist()
+                # ticks allowed from entry_start until the entry_end minute
+                # completes (14:59 candle in the backtest closes at 15:00)
+                if entry_start <= now < tick_window_end:
+                    ltp = live_ltp(ce_sym)
+                    if ltp > 0:
+                        leg.on_signal_tick(ltp, _save)
+            else:
                 closed = latest_closed_candle(ce_sym)
                 if closed:
-                    leg.on_be_candle(closed[1], _save)
-        # Flip signal on closed 1-minute candles inside the entry window.
-        elif leg.state in (FlipLeg.WATCHING, FlipLeg.PAPER_SHORT):
-            closed = latest_closed_candle(ce_sym)
-            if closed:
-                candle_minute, candle_close = closed
-                try:
-                    candle_dt = datetime.fromisoformat(candle_minute)
-                except ValueError:
-                    candle_dt = None
-                if candle_dt is not None and candle_dt >= entry_start:
-                    end_gate = candle_dt.replace(
-                        hour=ENTRY_END_H, minute=ENTRY_END_M, second=0, microsecond=0
-                    )
-                    if candle_dt <= end_gate:
-                        leg.on_signal_candle(candle_minute, candle_close, _save)
+                    candle_minute, candle_close = closed
+                    try:
+                        candle_dt = datetime.fromisoformat(candle_minute)
+                    except ValueError:
+                        candle_dt = None
+                    if candle_dt is not None and candle_dt >= entry_start:
+                        end_gate = candle_dt.replace(
+                            hour=ENTRY_END_H, minute=ENTRY_END_M, second=0, microsecond=0
+                        )
+                        if candle_dt <= end_gate:
+                            leg.on_signal_candle(candle_minute, candle_close, _save)
 
         _maybe_refresh_status(legs, expiry)
 
@@ -2045,9 +2113,13 @@ def run_day2():
                     leg.on_tick(ltp, _save)
                 # Breakeven stop: Day-2 giveback to entry = dying trade.
                 if leg.is_long:
-                    closed = latest_closed_candle(leg.symbol)
-                    if closed:
-                        leg.on_be_candle(closed[1], _save)
+                    if TRIGGER_MODE == "TICK":
+                        if ltp > 0:
+                            leg.on_be_price(ltp, _save)
+                    else:
+                        closed = latest_closed_candle(leg.symbol)
+                        if closed:
+                            leg.on_be_price(closed[1], _save)
 
         _maybe_refresh_status(legs, expiry)
 
@@ -2126,7 +2198,8 @@ def main():
     log.info("=" * 60)
     log.info(
         "%s BTST Flip engine v%s  |  id=%s  |  ITM-%d CE  |  lots=%d  |  "
-        "drop=%.1f%%  vsl=%.1f%%  sl=%.1f%%  vix≤%.1f  dte=%d–%d  |  host=%s",
+        "drop=%.1f%%  vsl=%.1f%%  sl=%.1f%%  be=%.1f%%  vix≤%.1f  dte=%d–%d  |  "
+        "trigger=%s  |  host=%s",
         UNDERLYING,
         VERSION,
         STRATEGY_ID,
@@ -2135,9 +2208,11 @@ def main():
         DROP_PCT,
         VSL_PCT,
         REAL_SL_PCT,
+        BE_TRIGGER_PCT,
         VIX_MAX,
         DTE_MIN,
         DTE_MAX,
+        TRIGGER_MODE,
         HOST,
     )
     log.info("=" * 60)
@@ -2235,9 +2310,13 @@ def _resume_same_day(state: dict):
                 if ltp > 0:
                     leg.on_tick(ltp, _save)
                 if leg.is_long:
-                    closed = latest_closed_candle(leg.symbol)
-                    if closed:
-                        leg.on_be_candle(closed[1], _save)
+                    if TRIGGER_MODE == "TICK":
+                        if ltp > 0:
+                            leg.on_be_price(ltp, _save)
+                    else:
+                        closed = latest_closed_candle(leg.symbol)
+                        if closed:
+                            leg.on_be_price(closed[1], _save)
         _maybe_refresh_status(legs, expiry)
         if MAX_LOSS > 0 and any(leg.is_long for leg in legs):
             total = _total_net(legs)

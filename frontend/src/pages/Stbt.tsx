@@ -83,6 +83,7 @@ interface FormState {
   real_sl_pct: string
   be_trigger_pct: string
   vix_max: string
+  trigger_mode: 'TICK' | 'CANDLE_CLOSE'
   candle_source: 'WS' | 'HISTORY'
   dte_min: string
   dte_max: string
@@ -121,6 +122,7 @@ const DEFAULT_FORM: FormState = {
   real_sl_pct: '30',
   be_trigger_pct: '30',
   vix_max: '18',
+  trigger_mode: 'TICK',
   candle_source: 'WS',
   dte_min: '1',
   dte_max: '3',
@@ -160,6 +162,7 @@ function formFromConfig(config: StbtConfig): FormState {
     real_sl_pct: String(p.real_sl_pct ?? 30),
     be_trigger_pct: String(p.be_trigger_pct ?? 30),
     vix_max: String(p.vix_max ?? 18),
+    trigger_mode: p.trigger_mode === 'CANDLE_CLOSE' ? 'CANDLE_CLOSE' : 'TICK',
     candle_source: p.candle_source === 'HISTORY' ? 'HISTORY' : 'WS',
     dte_min: String(p.dte_min ?? 1),
     dte_max: String(p.dte_max ?? 3),
@@ -205,6 +208,7 @@ function payloadFromForm(form: FormState): StbtConfigPayload {
       real_sl_pct: Number(form.real_sl_pct),
       be_trigger_pct: Number(form.be_trigger_pct),
       vix_max: Number(form.vix_max),
+      trigger_mode: form.trigger_mode,
       candle_source: form.candle_source,
       dte_min: Number(form.dte_min),
       dte_max: Number(form.dte_max),
@@ -840,6 +844,11 @@ export default function Stbt() {
                         <span>
                           DTE {config.params?.dte_min ?? 1}–{config.params?.dte_max ?? 3}
                         </span>
+                        <span>
+                          {config.params?.trigger_mode === 'CANDLE_CLOSE'
+                            ? '1m-close triggers'
+                            : 'tick triggers'}
+                        </span>
                         <span>lots ×{config.params?.lot_multiplier ?? 1}</span>
                       </>
                     ) : (
@@ -977,13 +986,13 @@ export default function Stbt() {
                 {numberField('Max loss ₹ (0 = off)', 'max_loss', { step: '500', min: '0' })}
 
                 <div className="space-y-1.5">
-                  <Label>Signal candle source</Label>
+                  <Label>Signal trigger</Label>
                   <Select
-                    value={form.candle_source}
+                    value={form.trigger_mode}
                     onValueChange={(value) =>
                       setForm((prev) => ({
                         ...prev,
-                        candle_source: value as FormState['candle_source'],
+                        trigger_mode: value as FormState['trigger_mode'],
                       }))
                     }
                   >
@@ -991,11 +1000,36 @@ export default function Stbt() {
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
-                      <SelectItem value="WS">WebSocket ticks (live feed)</SelectItem>
-                      <SelectItem value="HISTORY">History API (official 1-min close)</SelectItem>
+                      <SelectItem value="TICK">Live ticks — act the instant a level is hit</SelectItem>
+                      <SelectItem value="CANDLE_CLOSE">
+                        1-min candle close — backtest parity
+                      </SelectItem>
                     </SelectContent>
                   </Select>
                 </div>
+
+                {form.trigger_mode === 'CANDLE_CLOSE' && (
+                  <div className="space-y-1.5">
+                    <Label>Signal candle source</Label>
+                    <Select
+                      value={form.candle_source}
+                      onValueChange={(value) =>
+                        setForm((prev) => ({
+                          ...prev,
+                          candle_source: value as FormState['candle_source'],
+                        }))
+                      }
+                    >
+                      <SelectTrigger>
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="WS">WebSocket ticks (live feed)</SelectItem>
+                        <SelectItem value="HISTORY">History API (official 1-min close)</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                )}
 
                 <div className="space-y-1.5 sm:col-span-2">
                   <Label>Entry days (Friday off = weekend theta filter)</Label>

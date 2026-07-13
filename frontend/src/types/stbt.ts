@@ -24,6 +24,7 @@ export interface StbtParams {
   real_sl_pct?: number
   be_trigger_pct?: number
   vix_max?: number
+  trigger_mode?: 'TICK' | 'CANDLE_CLOSE'
   candle_source?: 'WS' | 'HISTORY'
   dte_min?: number
   dte_max?: number

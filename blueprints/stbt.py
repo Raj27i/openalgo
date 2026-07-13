@@ -105,7 +105,8 @@ _TIME_PARAMS = {
     ),
 }
 _REENTRY_METHODS = {"CANDLE_CLOSE", "LTP"}
-_CANDLE_SOURCES = {"WS", "HISTORY"}  # btst signal-candle source
+_CANDLE_SOURCES = {"WS", "HISTORY"}  # btst signal-candle source (CANDLE_CLOSE mode)
+_TRIGGER_MODES = {"TICK", "CANDLE_CLOSE"}  # btst signal trigger mode
 
 LAUNCHER_TEMPLATE = '''#!/usr/bin/env python
 """Auto-generated STBT launcher — managed by the /stbt tab.
@@ -251,6 +252,12 @@ def _validate_params(
 
         if "allow_day2_reentry" in data and data["allow_day2_reentry"] is not None:
             clean["allow_day2_reentry"] = bool(data["allow_day2_reentry"])
+
+    if strategy_type == "btst" and data.get("trigger_mode"):
+        mode = str(data["trigger_mode"]).upper().strip()
+        if mode not in _TRIGGER_MODES:
+            return {}, f"trigger_mode must be one of {sorted(_TRIGGER_MODES)}"
+        clean["trigger_mode"] = mode
 
     if strategy_type == "btst" and data.get("candle_source"):
         source = str(data["candle_source"]).upper().strip()
